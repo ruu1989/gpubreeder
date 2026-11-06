@@ -1,4 +1,4 @@
-//! Chains search layers into generations and reconstructs step-by-step plans.
+//! Cheapest-first search over crossings, and reconstruction of step-by-step plans.
 
 use crate::genes::*;
 use crate::rules::*;
@@ -6,119 +6,87 @@ use crate::search::*;
 use anyhow::{bail, Result};
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashSet};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug)]
 pub struct PlanConfig {
-    pub generations: usize,
-    /// Most plants carried into the next generation.
-    pub carry: usize,
-    pub layer: LayerConfig,
+    /// Stop after this many crossings per plant.
+    pub max_crossings: u32,
+    pub max_plants: usize,
     pub target: Option<Genotype>,
+    pub time_limit: Option<Duration>,
 }
 
 #[derive(Clone, Debug)]
-pub struct GenerationStats {
-    pub generation: usize,
+pub struct RoundStats {
+    /// Result plants of this round cost this many crossings.
+    pub crossings: u32,
     pub pool: usize,
     pub new_genotypes: usize,
-    pub groups: u128,
+    pub complete: bool,
     pub seconds: f64,
 }
 
-/// Every genotype reached, with how to make it.
+/// A reached genotype and how it was made.
+#[derive(Clone, Debug)]
+pub struct Entry {
+    /// Crossings including every ancestor, counted separately per branch.
+    pub cost: u32,
+    /// Longest chain of crossings before this plant exists.
+    pub generation: u32,
+    pub recipe: Recipe,
+}
+
 pub struct Outcome {
     pub inputs: Vec<Genotype>,
-    pub recipes: BTreeMap<Genotype, (usize, Recipe)>,
-    pub stats: Vec<GenerationStats>,
+    pub reached: BTreeMap<Genotype, Entry>,
+    pub stats: Vec<RoundStats>,
 }
 
-fn multisets(n: u128, k: u128) -> u128 {
-    if n == 0 {
-        return 0;
+impl Outcome {
+    /// Costs up to this are proven cheapest: every round up to it ran to completion.
+    pub fn proven_up_to(&self) -> u32 {
+        self.stats.iter().take_while(|s| s.complete).map(|s| s.crossings).max().unwrap_or(0)
     }
-    (1..=k).fold(1u128, |acc, i| acc * (n + i - 1) / i)
 }
 
-/// Picks plants that fill the pool's weakest slots, judged by `value`.
-fn choose_carry(pool: &[Genotype], bench: &[Genotype], carry: usize, value: impl Fn(u8, usize) -> i32) -> Vec<Genotype> {
-    let mut columns = [0i64; SLOTS];
-    for plant in pool {
-        for (slot, gene) in plant.genes().into_iter().enumerate() {
-            columns[slot] += value(gene, slot) as i64;
-        }
-    }
-    let mut left: Vec<(Genotype, [i32; SLOTS])> = bench
-        .iter()
-        .map(|&g| {
-            let genes = g.genes();
-            (g, std::array::from_fn(|slot| value(genes[slot], slot)))
-        })
-        .collect();
-    let mut chosen = Vec::new();
-    for _ in 0..carry.min(left.len()) {
-        let mut order: [usize; SLOTS] = std::array::from_fn(|i| i);
-        order.sort_by_key(|&slot| columns[slot]);
-        let key = |values: &[i32; SLOTS]| order.map(|slot| values[slot]);
-        let pick = left.par_iter().enumerate().max_by_key(|(_, (g, values))| (key(values), g.0)).map(|(i, _)| i).unwrap();
-        let (plant, values) = left.swap_remove(pick);
-        for slot in 0..SLOTS {
-            columns[slot] += values[slot] as i64;
-        }
-        chosen.push(plant);
-    }
-    chosen
-}
-
-pub fn run(inputs: &[Genotype], cfg: &PlanConfig, backend: &mut dyn Backend, mut progress: impl FnMut(&GenerationStats)) -> Result<Outcome> {
+pub fn run(inputs: &[Genotype], cfg: &PlanConfig, backend: &mut dyn Backend, mut progress: impl FnMut(&RoundStats)) -> Result<Outcome> {
     let mut seen = HashSet::new();
     let inputs: Vec<Genotype> = inputs.iter().copied().filter(|g| seen.insert(*g)).collect();
     let mut known = vec![false; GENOTYPES];
+    let mut generation_of = vec![0u32; GENOTYPES];
     for g in &inputs {
         known[g.0 as usize] = true;
     }
     let mut pool = inputs.clone();
-    let mut outcome = Outcome { inputs, recipes: BTreeMap::new(), stats: Vec::new() };
-    let target = cfg.target.map(Genotype::genes);
-    let scores = cfg.layer.scores;
-    let value = |gene: u8, slot: usize| match target {
-        Some(t) => i32::from(t[slot] == gene),
-        None => scores.0[gene as usize],
-    };
+    let mut costs = vec![0u32; pool.len()];
+    let mut outcome = Outcome { inputs, reached: BTreeMap::new(), stats: Vec::new() };
+    let deadline = cfg.time_limit.map(|limit| Instant::now() + limit);
 
-    for generation in 1..=cfg.generations {
+    for budget in 0..cfg.max_crossings {
         let started = Instant::now();
-        let wanted = match cfg.target {
-            Some(t) if generation == cfg.generations => (0..GENOTYPES).map(|i| i == t.0 as usize && !known[i]).collect(),
-            _ => wanted_mask(&known, &cfg.layer),
-        };
-        let found = backend.layer(&pool, &wanted, cfg.layer.max_plants)?;
-        let recipes: Vec<Recipe> = found.par_iter().map(|(g, c)| confirm(*g, c)).collect::<Result<_>>()?;
+        let wanted: Vec<bool> = known.iter().map(|k| !k).collect();
+        let result = backend.layer(&LayerRequest { pool: &pool, costs: &costs, wanted: &wanted, max_plants: cfg.max_plants, budget, deadline })?;
+        let recipes: Vec<Recipe> = result.found.par_iter().map(|(g, c)| confirm(*g, c)).collect::<Result<_>>()?;
         let new_genotypes = recipes.len();
         for recipe in recipes {
-            known[recipe.result.0 as usize] = true;
-            outcome.recipes.insert(recipe.result, (generation, recipe));
+            let parents = recipe.order.iter().chain(recipe.centre.iter());
+            let generation = 1 + parents.map(|p| generation_of[p.0 as usize]).max().unwrap_or(0);
+            let result = recipe.result;
+            known[result.0 as usize] = true;
+            generation_of[result.0 as usize] = generation;
+            pool.push(result);
+            costs.push(budget + 1);
+            outcome.reached.insert(result, Entry { cost: budget + 1, generation, recipe });
         }
-        let stats = GenerationStats {
-            generation,
-            pool: pool.len(),
-            new_genotypes,
-            groups: (1..=cfg.layer.max_plants.min(MAX_NEIGHBOURS) as u128).map(|k| multisets(pool.len() as u128, k)).sum(),
-            seconds: started.elapsed().as_secs_f64(),
-        };
+        let stats = RoundStats { crossings: budget + 1, pool: pool.len(), new_genotypes, complete: result.complete, seconds: started.elapsed().as_secs_f64() };
         progress(&stats);
         outcome.stats.push(stats);
 
-        if cfg.target.is_some_and(|t| outcome.recipes.contains_key(&t)) || generation == cfg.generations {
+        let target_done = cfg.target.is_some_and(|t| outcome.reached.contains_key(&t));
+        if target_done || !result.complete || known.iter().all(|&k| k) {
             break;
         }
-        let in_pool: HashSet<Genotype> = pool.iter().copied().collect();
-        let bench: Vec<Genotype> = outcome.recipes.keys().copied().filter(|g| !in_pool.contains(g)).collect();
-        if bench.is_empty() {
-            break;
-        }
-        let chosen = choose_carry(&pool, &bench, cfg.carry, value);
-        pool.extend(chosen);
     }
     Ok(outcome)
 }
@@ -126,7 +94,7 @@ pub fn run(inputs: &[Genotype], cfg: &PlanConfig, backend: &mut dyn Backend, mut
 /// A complete plan, parents first.
 pub struct Plan {
     pub goal: Genotype,
-    pub generation: usize,
+    pub generation: u32,
     pub steps: Vec<Recipe>,
     /// Input genotypes the plan uses.
     pub inputs_used: Vec<Genotype>,
@@ -134,36 +102,35 @@ pub struct Plan {
 
 impl Outcome {
     pub fn plan(&self, goal: Genotype) -> Option<Plan> {
-        let (generation, _) = self.recipes.get(&goal)?;
+        let generation = self.reached.get(&goal)?.generation;
         let mut steps = Vec::new();
         let mut done = HashSet::new();
         let mut used = HashSet::new();
         fn visit(outcome: &Outcome, g: Genotype, steps: &mut Vec<Recipe>, done: &mut HashSet<Genotype>, used: &mut HashSet<Genotype>) {
-            let Some((_, recipe)) = outcome.recipes.get(&g) else {
+            let Some(entry) = outcome.reached.get(&g) else {
                 used.insert(g);
                 return;
             };
             if !done.insert(g) {
                 return;
             }
-            for &parent in recipe.order.iter().chain(recipe.centre.iter()) {
+            for &parent in entry.recipe.order.iter().chain(entry.recipe.centre.iter()) {
                 visit(outcome, parent, steps, done, used);
             }
-            steps.push(recipe.clone());
+            steps.push(entry.recipe.clone());
         }
         visit(self, goal, &mut steps, &mut done, &mut used);
         let mut inputs_used: Vec<Genotype> = used.into_iter().collect();
         inputs_used.sort();
-        Some(Plan { goal, generation: *generation, steps, inputs_used })
+        Some(Plan { goal, generation, steps, inputs_used })
     }
 
-    /// Best results: highest score, then earliest generation, then fewest crossings.
+    /// Best results: highest score, then fewest crossings, then fewest generations.
     pub fn best(&self, scores: &Scores, count: usize) -> Vec<Plan> {
-        let top = self.recipes.keys().map(|g| g.score(scores)).max().unwrap_or(0);
-        let mut goals: Vec<Genotype> = self.recipes.keys().copied().filter(|g| g.score(scores) == top).collect();
-        goals.sort();
-        let mut plans: Vec<Plan> = goals.into_iter().filter_map(|g| self.plan(g)).collect();
-        plans.sort_by_key(|p| (p.generation, p.steps.len(), p.goal));
+        let top = self.reached.keys().map(|g| g.score(scores)).max().unwrap_or(0);
+        let goals = self.reached.keys().copied().filter(|g| g.score(scores) == top);
+        let mut plans: Vec<Plan> = goals.filter_map(|g| self.plan(g)).collect();
+        plans.sort_by_key(|p| (p.steps.len(), p.generation, p.goal));
         plans.truncate(count);
         plans
     }
@@ -204,49 +171,78 @@ pub fn order_matters(recipe: &Recipe) -> bool {
 mod tests {
     use super::*;
 
-    fn config(generations: usize, target: Option<Genotype>) -> PlanConfig {
-        PlanConfig {
-            generations,
-            carry: 40,
-            layer: LayerConfig { max_plants: 5, min_score: 300, scores: Scores::default() },
-            target,
-        }
+    fn config(max_crossings: u32, target: Option<Genotype>) -> PlanConfig {
+        PlanConfig { max_crossings, max_plants: 3, target, time_limit: None }
     }
 
-    const SET1: &str = "WGXYYW WGGXYW WGYXGW WYYXGW XYYXGW XYGXYW YWGYGX WGGWYX XGYWGG XGYWYX WYYWGW XYYGWX YXGWGX WYGXYW WGWGYW WYWXGG XYGWGW WGYWGW XYYWYW XYGWYX XYGXYX WGGXYX XYGWYW";
+    const SMALL: &str = "GGGYYH XGHGWY HGGGYH YGHWGX WGGYYY";
 
     #[test]
     fn every_plan_replays_with_real_rules() {
-        let inputs = parse_list(SET1).unwrap();
+        let inputs = parse_list(SMALL).unwrap();
         let outcome = run(&inputs, &config(2, None), &mut CpuBackend, |_| {}).unwrap();
-        assert!(outcome.recipes.len() > 200);
-        for &goal in outcome.recipes.keys() {
+        assert!(outcome.reached.len() > 50);
+        for &goal in outcome.reached.keys() {
             outcome.plan(goal).unwrap().check(&outcome.inputs).unwrap();
         }
     }
 
     #[test]
     fn a_plan_with_a_missing_parent_is_rejected() {
-        let inputs = parse_list(SET1).unwrap();
-        let outcome = run(&inputs, &config(2, None), &mut CpuBackend, |_| {}).unwrap();
+        let inputs = parse_list(SMALL).unwrap();
+        let outcome = run(&inputs, &config(1, None), &mut CpuBackend, |_| {}).unwrap();
         let plan = outcome.best(&Scores::default(), 1).remove(0);
-        let stranger = Genotype::parse("HHHHHH").unwrap();
-        assert!(plan.check(&[stranger]).is_err());
+        assert!(plan.check(&[Genotype::parse("HHHHHH").unwrap()]).is_err());
+    }
+
+    /// Shortest routes from a tiny pool, computed independently by exhausting every chain.
+    #[test]
+    fn prices_are_the_true_minimum() {
+        let inputs = parse_list("GGGGGY YYYYYW").unwrap();
+        let outcome = run(&inputs, &PlanConfig { max_crossings: 3, max_plants: 3, target: None, time_limit: None }, &mut CpuBackend, |_| {}).unwrap();
+
+        // Bellman-Ford over the reference simulation: cost of a crossing is its distinct parents.
+        let mut best: BTreeMap<Genotype, u32> = inputs.iter().map(|g| (*g, 0)).collect();
+        for _ in 0..4 {
+            let plants: Vec<(Genotype, u32)> = best.iter().map(|(g, c)| (*g, *c)).collect();
+            let mut updates = Vec::new();
+            for &(a, ca) in &plants {
+                for &(b, cb) in &plants {
+                    for &(c, cc) in &plants {
+                        for &(centre, cz) in &plants {
+                            let mut seen: BTreeMap<Genotype, u32> = BTreeMap::new();
+                            for (g, cost) in [(a, ca), (b, cb), (c, cc), (centre, cz)] {
+                                seen.insert(g, cost);
+                            }
+                            let price = 1 + seen.values().sum::<u32>();
+                            if price > 3 {
+                                continue;
+                            }
+                            for group in [vec![a], vec![a, b], vec![a, b, c]] {
+                                updates.push((game_cross(&group, centre), price));
+                            }
+                        }
+                    }
+                }
+            }
+            for (g, price) in updates {
+                let slot = best.entry(g).or_insert(u32::MAX);
+                *slot = (*slot).min(price);
+            }
+        }
+        for (g, price) in best.iter().filter(|(_, p)| **p > 0) {
+            let entry = outcome.reached.get(g).unwrap_or_else(|| panic!("{g} at price {price} was missed"));
+            assert!(entry.cost <= *price, "{g}: search says {}, reference says {price}", entry.cost);
+        }
     }
 
     #[test]
     fn a_target_search_stops_once_reached() {
-        let inputs = parse_list(SET1).unwrap();
-        let target = Genotype::parse("YGGYGG").unwrap();
-        let outcome = run(&inputs, &config(3, Some(target)), &mut CpuBackend, |_| {}).unwrap();
-        let plan = outcome.plan(target).expect("site reaches this in two generations");
-        assert!(plan.generation <= 2);
-        plan.check(&outcome.inputs).unwrap();
-    }
-
-    #[test]
-    fn multiset_count_matches_known_values() {
-        assert_eq!(multisets(23, 5), 80_730);
-        assert_eq!(multisets(70 - 7, 8), 9_440_350_920);
+        let inputs = parse_list(SMALL).unwrap();
+        let outcome = run(&inputs, &config(1, None), &mut CpuBackend, |_| {}).unwrap();
+        let target = *outcome.reached.keys().next().unwrap();
+        let focused = run(&inputs, &config(5, Some(target)), &mut CpuBackend, |_| {}).unwrap();
+        assert_eq!(focused.stats.len(), 1);
+        assert!(focused.plan(target).is_some());
     }
 }

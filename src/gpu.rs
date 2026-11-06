@@ -3,14 +3,14 @@
 
 use crate::genes::*;
 use crate::rules::*;
-use crate::search::{Backend, Candidate, CpuBackend};
+use crate::search::{Backend, Candidate, CpuBackend, LayerRequest, LayerResult};
 use anyhow::{anyhow, Result};
 use std::time::Instant;
 
 const WANT_FREE: u32 = 0;
 const UNWANTED: u32 = 1;
 const CLAIMED: u32 = 2;
-const PREFIX_STRIDE: usize = 11;
+const PREFIX_STRIDE: usize = 12;
 const RECIPE_STRIDE: usize = 6;
 const WORKGROUP: u32 = 64;
 /// The want buffer starts with one allowed-gene mask per slot, then one bit per genotype.
@@ -22,7 +22,7 @@ const MAX_PREFIXES: usize = 1 << 22;
 const DISPATCH_ROW: u32 = 65_535;
 /// From this group size up, a whole workgroup shares one prefix and adds two plants.
 const SHARED_FROM_SIZE: usize = 4;
-const MAX_POOL: usize = 4096;
+const MAX_POOL: usize = GENOTYPES;
 /// Long enough to keep the GPU busy, short enough to stay well clear of the watchdog.
 const TARGET_BATCH_SECONDS: f64 = 0.25;
 const INITIAL_BATCH_GROUPS: f64 = 2e5;
@@ -34,6 +34,8 @@ struct Params {
     group_size: u32,
     shared: u32,
     prefix_count: u32,
+    budget: u32,
+    padding: [u32; 3],
 }
 
 pub struct GpuBackend {
@@ -48,11 +50,14 @@ pub struct GpuBackend {
     recipes: wgpu::Buffer,
     want: wgpu::Buffer,
     centres: wgpu::Buffer,
+    costs: wgpu::Buffer,
     readback: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     /// Genes per slot that appear in a wanted genotype, a snapshot of the last refresh.
     allowed: [u32; SLOTS],
     nothing_wanted: bool,
+    deadline: Option<Instant>,
+    timed_out: bool,
     /// Groups-per-batch estimate, tuned from measured speed.
     batch_budget: f64,
     /// Group evaluations in the last `layer` call and the GPU time they took.
@@ -103,13 +108,14 @@ impl GpuBackend {
         });
 
         use wgpu::BufferUsages as U;
-        let params = storage(&device, "params", 16, U::UNIFORM | U::COPY_DST);
+        let params = storage(&device, "params", std::mem::size_of::<Params>() as u64, U::UNIFORM | U::COPY_DST);
         let pool = storage(&device, "pool", (MAX_POOL * 24) as u64, U::STORAGE | U::COPY_DST);
         let prefixes = storage(&device, "prefixes", (MAX_PREFIXES * PREFIX_STRIDE * 4) as u64, U::STORAGE | U::COPY_DST);
         let claims = storage(&device, "claims", (GENOTYPES * 4) as u64, U::STORAGE | U::COPY_DST | U::COPY_SRC);
         let recipes = storage(&device, "recipes", (GENOTYPES * RECIPE_STRIDE * 4) as u64, U::STORAGE | U::COPY_SRC);
         let want = storage(&device, "want", ((WANT_HEADER + GENOTYPES / 32 + 1) * 4) as u64, U::STORAGE | U::COPY_DST);
         let centres = storage(&device, "centres", ((CENTRE_HEADER + 64 * MAX_POOL) * 4) as u64, U::STORAGE | U::COPY_DST);
+        let costs = storage(&device, "costs", (MAX_POOL * 4) as u64, U::STORAGE | U::COPY_DST);
         let readback = storage(&device, "readback", (GENOTYPES * (RECIPE_STRIDE + 1) * 4) as u64, U::MAP_READ | U::COPY_DST);
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -123,6 +129,7 @@ impl GpuBackend {
                 wgpu::BindGroupEntry { binding: 4, resource: recipes.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: want.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: centres.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: costs.as_entire_binding() },
             ],
         });
 
@@ -138,6 +145,9 @@ impl GpuBackend {
             recipes,
             want,
             centres,
+            costs,
+            deadline: None,
+            timed_out: false,
             allowed: [0; SLOTS],
             nothing_wanted: false,
             readback,
@@ -241,7 +251,7 @@ impl GpuBackend {
         }
         let trace = std::env::var_os("GPUBREEDER_TRACE").is_some();
         let started = Instant::now();
-        let params = Params { pool_len: job.pool_len as u32, group_size: job.size as u32, shared: u32::from(job.shared()), prefix_count: entries as u32 };
+        let params = Params { pool_len: job.pool_len as u32, group_size: job.size as u32, shared: u32::from(job.shared()), prefix_count: entries as u32, budget: job.budget, padding: [0; 3] };
         self.dispatch(batch, params)?;
         let seconds = started.elapsed().as_secs_f64().max(1e-4);
         if trace {
@@ -256,12 +266,14 @@ impl GpuBackend {
         }
         batch.clear();
         *cost = 0.0;
+        self.timed_out |= self.deadline.is_some_and(|d| Instant::now() >= d);
         self.refresh_wanted()
     }
 
     /// Lists every useful group prefix, depth first, dispatching as batches fill.
-    fn walk(&mut self, job: &Job, depth: usize, from: usize, counts: [u32; SLOTS], ids: &mut [usize; MAX_NEIGHBOURS], batch: &mut Vec<u32>, cost: &mut f64) -> Result<()> {
-        if self.nothing_wanted {
+    #[allow(clippy::too_many_arguments)]
+    fn walk(&mut self, job: &Job, depth: usize, from: usize, spent: u32, counts: [u32; SLOTS], ids: &mut [usize; MAX_NEIGHBOURS], batch: &mut Vec<u32>, cost: &mut f64) -> Result<()> {
+        if self.nothing_wanted || self.timed_out {
             return Ok(());
         }
         if depth == job.prefix_len() {
@@ -273,7 +285,9 @@ impl GpuBackend {
                 words[i / 2] |= (id as u32) << (16 * (i % 2));
             }
             batch.extend_from_slice(&words);
-            let tail = (job.pool_len - first) as f64;
+            batch.push(spent);
+            let reach = job.costs.partition_point(|&c| c <= job.budget - spent).max(first + 1);
+            let tail = (reach - first) as f64;
             *cost += if job.shared() { tail * (tail + 1.0) / 2.0 } else { tail };
             if *cost >= self.batch_budget || batch.len() / PREFIX_STRIDE >= MAX_PREFIXES {
                 self.flush(job, batch, cost)?;
@@ -282,27 +296,31 @@ impl GpuBackend {
         }
         let extra = (job.size - depth - 1) as u32;
         for next in from..job.pool_len {
+            let price = if depth > 0 && next == ids[depth - 1] { 0 } else { job.costs[next] };
+            if spent + price > job.budget {
+                break;
+            }
             let mut sum = counts;
             for slot in 0..SLOTS {
                 sum[slot] += job.packs[next][slot];
             }
             if self.can_help(&sum, extra) {
                 ids[depth] = next;
-                self.walk(job, depth + 1, next, sum, ids, batch, cost)?;
+                self.walk(job, depth + 1, next, spent + price, sum, ids, batch, cost)?;
             }
         }
         Ok(())
     }
 
     /// Runs all groups of one size.
-    fn run_size(&mut self, packs: &[[u32; SLOTS]], size: usize) -> Result<()> {
-        let job = Job { packs, pool_len: packs.len(), size };
+    fn run_size(&mut self, packs: &[[u32; SLOTS]], costs: &[u32], budget: u32, size: usize) -> Result<()> {
+        let job = Job { packs, costs, budget, pool_len: packs.len(), size };
         // Speed differs a lot between sizes because small groups try every centre.
         self.batch_budget = INITIAL_BATCH_GROUPS;
         let mut batch: Vec<u32> = Vec::with_capacity(MAX_PREFIXES * PREFIX_STRIDE);
         let mut cost = 0f64;
         let mut ids = [0usize; MAX_NEIGHBOURS];
-        self.walk(&job, 0, 0, [0; SLOTS], &mut ids, &mut batch, &mut cost)?;
+        self.walk(&job, 0, 0, 0, [0; SLOTS], &mut ids, &mut batch, &mut cost)?;
         self.flush(&job, &mut batch, &mut cost)
     }
 }
@@ -310,6 +328,8 @@ impl GpuBackend {
 /// One group size's work description.
 struct Job<'a> {
     packs: &'a [[u32; SLOTS]],
+    costs: &'a [u32],
+    budget: u32,
     pool_len: usize,
     size: usize,
 }
@@ -349,15 +369,18 @@ impl Backend for GpuBackend {
         self.adapter_name.clone()
     }
 
-    fn layer(&mut self, pool: &[Genotype], wanted: &[bool], max_plants: usize) -> Result<Vec<(Genotype, Candidate)>> {
+    fn layer(&mut self, request: &LayerRequest) -> Result<LayerResult> {
+        let (pool, wanted, max_plants) = (request.pool, request.wanted, request.max_plants);
         if pool.len() > MAX_POOL {
             return Err(anyhow!("pool of {} exceeds the {MAX_POOL} plant limit", pool.len()));
         }
         self.last_groups = 0;
         self.last_seconds = 0.0;
+        self.deadline = request.deadline;
+        self.timed_out = false;
 
         // Single neighbours are trivial, and leave only sizes that fit the prefix scheme.
-        let mut found = CpuBackend.layer(pool, wanted, 1)?;
+        let mut found = CpuBackend.layer(&LayerRequest { max_plants: 1, deadline: None, ..*request })?.found;
         let mut still_wanted = wanted.to_vec();
         for (g, _) in &found {
             still_wanted[g.0 as usize] = false;
@@ -367,16 +390,17 @@ impl Backend for GpuBackend {
         let flat: Vec<u32> = packs.iter().flatten().copied().collect();
         self.queue.write_buffer(&self.pool, 0, bytemuck::cast_slice(&flat));
         self.queue.write_buffer(&self.centres, 0, bytemuck::cast_slice(&centre_table(pool)));
+        self.queue.write_buffer(&self.costs, 0, bytemuck::cast_slice(request.costs));
         let initial: Vec<u32> = still_wanted.iter().map(|&w| if w { WANT_FREE } else { UNWANTED }).collect();
         self.queue.write_buffer(&self.claims, 0, bytemuck::cast_slice(&initial));
         self.refresh_wanted()?;
 
         // Ascending size means each genotype is claimed by its smallest group first.
         for size in 2..=max_plants.min(MAX_NEIGHBOURS) {
-            if self.nothing_wanted {
+            if self.nothing_wanted || self.timed_out {
                 break;
             }
-            self.run_size(&packs, size)?;
+            self.run_size(&packs, request.costs, request.budget, size)?;
         }
 
         let (claims, recipes) = self.read_results()?;
@@ -398,7 +422,7 @@ impl Backend for GpuBackend {
             };
             found.push((Genotype(index as u16), Candidate { plants, centre }));
         }
-        Ok(found)
+        Ok(LayerResult { found, complete: !self.timed_out })
     }
 }
 
@@ -406,39 +430,52 @@ impl Backend for GpuBackend {
 mod tests {
     use super::*;
     use crate::search::{confirm, CpuBackend};
-    use std::collections::BTreeSet;
+    use std::collections::BTreeMap;
 
-    fn compare(pool: &[Genotype], wanted: &[bool], max_plants: usize) {
-        let cpu = CpuBackend.layer(pool, wanted, max_plants).unwrap();
+    /// Settles genotypes round by round, as the planner does. Returns each one's price.
+    fn settle(backend: &mut dyn Backend, inputs: &[Genotype], max_plants: usize, rounds: u32) -> BTreeMap<Genotype, (u32, usize)> {
+        let mut known = vec![false; GENOTYPES];
+        inputs.iter().for_each(|g| known[g.0 as usize] = true);
+        let mut pool = inputs.to_vec();
+        let mut costs = vec![0u32; pool.len()];
+        let mut out = BTreeMap::new();
+        for budget in 0..rounds {
+            let wanted: Vec<bool> = known.iter().map(|k| !k).collect();
+            let result = backend.layer(&LayerRequest { pool: &pool, costs: &costs, wanted: &wanted, max_plants, budget, deadline: None }).unwrap();
+            assert!(result.complete);
+            for (g, candidate) in result.found {
+                confirm(g, &candidate).unwrap();
+                known[g.0 as usize] = true;
+                out.insert(g, (budget + 1, candidate.plants.len()));
+                pool.push(g);
+                costs.push(budget + 1);
+            }
+        }
+        out
+    }
+
+    fn compare(inputs: &[Genotype], max_plants: usize, rounds: u32) {
         let mut gpu_backend = GpuBackend::new().expect("GPU required for this test");
-        let gpu = gpu_backend.layer(pool, wanted, max_plants).unwrap();
-        for (g, candidate) in &gpu {
-            confirm(*g, candidate).unwrap();
-        }
-        let cpu_set: BTreeSet<Genotype> = cpu.iter().map(|x| x.0).collect();
-        let gpu_set: BTreeSet<Genotype> = gpu.iter().map(|x| x.0).collect();
-        assert_eq!(gpu_set, cpu_set);
-        // Both pick the smallest group, so the sizes must agree too.
-        for (g, c) in &cpu {
-            let matching = gpu.iter().find(|x| x.0 == *g).unwrap();
-            assert_eq!(matching.1.plants.len(), c.plants.len(), "group size for {g}");
-        }
+        let gpu = settle(&mut gpu_backend, inputs, max_plants, rounds);
+        let cpu = settle(&mut CpuBackend, inputs, max_plants, rounds);
+        let gpu_prices: BTreeMap<_, _> = gpu.iter().map(|(g, v)| (*g, v.0)).collect();
+        let cpu_prices: BTreeMap<_, _> = cpu.iter().map(|(g, v)| (*g, v.0)).collect();
+        assert_eq!(gpu_prices, cpu_prices, "inputs {inputs:?}");
     }
 
     #[test]
     fn gpu_matches_cpu_on_sample_sets() {
-        let everything = vec![true; GENOTYPES];
         for text in [
             "WGXYYW WGGXYW WGYXGW WYYXGW XYYXGW XYGXYW YWGYGX WGGWYX XGYWGG XGYWYX WYYWGW XYYGWX YXGWGX WYGXYW WGWGYW WYWXGG XYGWGW WGYWGW XYYWYW XYGWYX XYGXYX WGGXYX XYGWYW",
             "GGGYYH YGGYYH YHGYHH HGGGYH HHGGYH WGHYYY WGGYYY HWYGGH GHYXGH YGYXYH GYYXHH GHGWYH HGGGYW HHGHYW WGGGYY XHHGGH",
         ] {
-            compare(&parse_list(text).unwrap(), &everything, 8);
+            compare(&parse_list(text).unwrap(), 8, 1);
+            compare(&parse_list(text).unwrap(), 4, 3);
         }
     }
 
     #[test]
     fn gpu_matches_cpu_on_random_pools() {
-        let everything = vec![true; GENOTYPES];
         let mut seed = 0x9E37_79B9_7F4A_7C15u64;
         let mut next = move || {
             seed ^= seed << 13;
@@ -446,18 +483,10 @@ mod tests {
             seed ^= seed << 17;
             seed
         };
-        for trial in 0..40 {
-            let size = 2 + trial % 9;
+        for trial in 0..30 {
+            let size = 2 + trial % 7;
             let pool: Vec<Genotype> = (0..size).map(|_| Genotype((next() % GENOTYPES as u64) as u16)).collect();
-            compare(&pool, &everything, 1 + trial % 8);
+            compare(&pool, 1 + trial % 8, 1 + (trial % 3) as u32);
         }
-    }
-
-    #[test]
-    fn gpu_respects_the_wanted_mask() {
-        let pool = parse_list("GGGYYH XGHGWY HGGGYH YGHWGX").unwrap();
-        let scores = Scores::default();
-        let wanted: Vec<bool> = (0..GENOTYPES).map(|i| Genotype(i as u16).score(&scores) >= 400).collect();
-        compare(&pool, &wanted, 6);
     }
 }

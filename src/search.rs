@@ -7,14 +7,7 @@ use crate::genes::*;
 use crate::rules::*;
 use anyhow::{bail, Result};
 use rayon::prelude::*;
-
-/// How to run one layer of search.
-#[derive(Clone, Copy, Debug)]
-pub struct LayerConfig {
-    pub max_plants: usize,
-    pub min_score: i32,
-    pub scores: Scores,
-}
+use std::time::Instant;
 
 /// A group of plants found by a backend, not yet given an order.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,16 +26,33 @@ pub struct Recipe {
     pub centre: Option<Genotype>,
 }
 
-pub trait Backend {
-    fn name(&self) -> String;
-    /// `wanted[g]` says the caller needs genotype `g`. Returns a candidate for every wanted
-    /// genotype that can be produced, preferring fewer neighbours.
-    fn layer(&mut self, pool: &[Genotype], wanted: &[bool], max_plants: usize) -> Result<Vec<(Genotype, Candidate)>>;
+/// One round of cheapest-first search.
+///
+/// Every plant has a cost, the crossings needed to make it. A crossing's price is the summed cost
+/// of its distinct plants, counting the centre, and a round covers exactly one price. Running
+/// rounds in rising order settles each genotype at its cheapest price.
+pub struct LayerRequest<'a> {
+    /// Sorted by ascending cost.
+    pub pool: &'a [Genotype],
+    pub costs: &'a [u32],
+    /// `wanted[g]` says genotype `g` is still unsettled.
+    pub wanted: &'a [bool],
+    pub max_plants: usize,
+    pub budget: u32,
+    pub deadline: Option<Instant>,
 }
 
-/// Genotypes worth searching for: new, and at or above the score floor.
-pub fn wanted_mask(known: &[bool], cfg: &LayerConfig) -> Vec<bool> {
-    (0..GENOTYPES).map(|i| !known[i] && Genotype(i as u16).score(&cfg.scores) >= cfg.min_score).collect()
+pub struct LayerResult {
+    pub found: Vec<(Genotype, Candidate)>,
+    /// False when the deadline cut the round short. What was found is still valid.
+    pub complete: bool,
+}
+
+pub trait Backend {
+    fn name(&self) -> String;
+    /// Returns a candidate for every wanted genotype this round can produce, preferring
+    /// fewer neighbours.
+    fn layer(&mut self, request: &LayerRequest) -> Result<LayerResult>;
 }
 
 /// Turns a backend's candidate into a recipe, refusing anything the reference rejects.
@@ -108,22 +118,30 @@ impl Backend for CpuBackend {
         format!("CPU ({} threads)", rayon::current_num_threads())
     }
 
-    fn layer(&mut self, pool: &[Genotype], wanted: &[bool], max_plants: usize) -> Result<Vec<(Genotype, Candidate)>> {
+    fn layer(&mut self, request: &LayerRequest) -> Result<LayerResult> {
         let table = SlotTable::new();
+        let pool = request.pool;
         let packs: Vec<[u32; SLOTS]> = pool.iter().map(|&g| packed(g)).collect();
-        let centres: Vec<(Genotype, [u8; SLOTS])> = pool.iter().map(|&g| (g, g.genes())).collect();
-        let mut remaining = wanted.to_vec();
+        let centres: Vec<[u8; SLOTS]> = pool.iter().map(|g| g.genes()).collect();
+        let mut remaining = request.wanted.to_vec();
         let mut found = Vec::new();
+        let mut complete = true;
 
-        for size in 1..=max_plants.min(MAX_NEIGHBOURS) {
+        for size in 1..=request.max_plants.min(MAX_NEIGHBOURS) {
+            if request.deadline.is_some_and(|d| Instant::now() >= d) {
+                complete = false;
+                break;
+            }
             let shards: Vec<Vec<Option<Candidate>>> = (0..pool.len())
                 .into_par_iter()
                 .map(|first| {
                     let mut best: Vec<Option<Candidate>> = vec![None; GENOTYPES];
-                    let mut ids = [0usize; MAX_NEIGHBOURS];
-                    ids[0] = first;
-                    let walk = Walk { pool, packs: &packs, centres: &centres, table: &table, wanted: &remaining, size };
-                    walk.descend(1, first, packs[first], &mut ids, &mut best);
+                    if request.costs[first] <= request.budget {
+                        let mut ids = [0usize; MAX_NEIGHBOURS];
+                        ids[0] = first;
+                        let walk = Walk { pool, costs: request.costs, budget: request.budget, packs: &packs, centres: &centres, table: &table, wanted: &remaining, size };
+                        walk.descend(1, first, request.costs[first], packs[first], &mut ids, &mut best);
+                    }
                     best
                 })
                 .collect();
@@ -142,55 +160,66 @@ impl Backend for CpuBackend {
                 }
             }
         }
-        Ok(found)
+        Ok(LayerResult { found, complete })
     }
 }
 
 struct Walk<'a> {
     pool: &'a [Genotype],
+    costs: &'a [u32],
+    budget: u32,
     packs: &'a [[u32; SLOTS]],
-    centres: &'a [(Genotype, [u8; SLOTS])],
+    centres: &'a [[u8; SLOTS]],
     table: &'a SlotTable,
     wanted: &'a [bool],
     size: usize,
 }
 
 impl Walk<'_> {
-    fn descend(&self, depth: usize, from: usize, counts: [u32; SLOTS], ids: &mut [usize; MAX_NEIGHBOURS], best: &mut [Option<Candidate>]) {
+    fn descend(&self, depth: usize, from: usize, spent: u32, counts: [u32; SLOTS], ids: &mut [usize; MAX_NEIGHBOURS], best: &mut [Option<Candidate>]) {
         if depth == self.size {
-            self.leaf(&ids[..depth], counts, best);
+            self.leaf(&ids[..depth], spent, counts, best);
             return;
         }
         for next in from..self.pool.len() {
+            let extra = if next == ids[depth - 1] { 0 } else { self.costs[next] };
+            if spent + extra > self.budget {
+                break;
+            }
             ids[depth] = next;
             let mut sum = counts;
             for slot in 0..SLOTS {
                 sum[slot] += self.packs[next][slot];
             }
-            self.descend(depth + 1, next, sum, ids, best);
+            self.descend(depth + 1, next, spent + extra, sum, ids, best);
         }
     }
 
-    fn leaf(&self, ids: &[usize], counts: [u32; SLOTS], best: &mut [Option<Candidate>]) {
+    fn leaf(&self, ids: &[usize], spent: u32, counts: [u32; SLOTS], best: &mut [Option<Candidate>]) {
         let slots: [SlotResult; SLOTS] = std::array::from_fn(|slot| self.table.0[counts[slot] as usize]);
         let plants = |ids: &[usize]| ids.iter().map(|&i| self.pool[i]).collect::<Vec<_>>();
         if centre_matters(&slots) {
-            for &(centre, genes) in self.centres {
-                outcomes(&slots, Some(genes), self.wanted, |index| {
-                    if best[index].is_none() {
+            for (index, genes) in self.centres.iter().enumerate() {
+                let extra = if ids.contains(&index) { 0 } else { self.costs[index] };
+                if spent + extra != self.budget {
+                    continue;
+                }
+                let centre = self.pool[index];
+                outcomes(&slots, Some(*genes), self.wanted, |g| {
+                    if best[g].is_none() {
                         let group = plants(ids);
-                        if planting_order(&group, Some(centre), Genotype(index as u16)).is_some() {
-                            best[index] = Some(Candidate { plants: group, centre: Some(centre) });
+                        if planting_order(&group, Some(centre), Genotype(g as u16)).is_some() {
+                            best[g] = Some(Candidate { plants: group, centre: Some(centre) });
                         }
                     }
                 });
             }
-        } else {
-            outcomes(&slots, None, self.wanted, |index| {
-                if best[index].is_none() {
+        } else if spent == self.budget {
+            outcomes(&slots, None, self.wanted, |g| {
+                if best[g].is_none() {
                     let group = plants(ids);
-                    if planting_order(&group, None, Genotype(index as u16)).is_some() {
-                        best[index] = Some(Candidate { plants: group, centre: None });
+                    if planting_order(&group, None, Genotype(g as u16)).is_some() {
+                        best[g] = Some(Candidate { plants: group, centre: None });
                     }
                 }
             });
@@ -229,14 +258,20 @@ mod tests {
         out
     }
 
+    pub fn free_round<'a>(pool: &'a [Genotype], costs: &'a [u32], wanted: &'a [bool], max_plants: usize) -> LayerRequest<'a> {
+        LayerRequest { pool, costs, wanted, max_plants, budget: 0, deadline: None }
+    }
+
     #[test]
     fn cpu_search_finds_exactly_what_brute_force_finds() {
         let pool = pool();
         let everything = vec![true; GENOTYPES];
-        let found = CpuBackend.layer(&pool, &everything, 5).unwrap();
-        let ours: HashSet<Genotype> = found.iter().map(|(g, _)| *g).collect();
+        let costs = vec![0; pool.len()];
+        let result = CpuBackend.layer(&free_round(&pool, &costs, &everything, 5)).unwrap();
+        assert!(result.complete);
+        let ours: HashSet<Genotype> = result.found.iter().map(|(g, _)| *g).collect();
         assert_eq!(ours, reference_results(&pool, 5));
-        for (g, candidate) in &found {
+        for (g, candidate) in &result.found {
             confirm(*g, candidate).unwrap();
         }
     }

@@ -5,7 +5,7 @@ use gpubreeder::gpu::GpuBackend;
 use gpubreeder::plan::*;
 use gpubreeder::search::*;
 use std::collections::BTreeMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Finds crossbreeding plans for Rust plants, using the game's exact rules.
 #[derive(Parser)]
@@ -20,18 +20,15 @@ struct Args {
     /// Stop at this exact genotype, e.g. GGGYYY
     #[arg(short, long)]
     target: Option<String>,
-    /// Generations to search
-    #[arg(long, default_value_t = 3)]
-    generations: usize,
-    /// Most plants carried into each next generation
-    #[arg(long, default_value_t = 200)]
-    carry: usize,
+    /// Most crossings to spend on one plant
+    #[arg(long, default_value_t = 12)]
+    max_crossings: u32,
     /// Most neighbours around a centre, 1 to 8
     #[arg(long, default_value_t = 5)]
     plants: usize,
-    /// Lowest score worth keeping as a stepping stone
-    #[arg(long, default_value_t = 3.0)]
-    min_score: f32,
+    /// Stop searching after this many seconds
+    #[arg(long, default_value_t = 60.0)]
+    seconds: f64,
     /// Number of plans to print when there is no target
     #[arg(long, default_value_t = 3)]
     top: usize,
@@ -93,22 +90,20 @@ fn main() -> Result<()> {
     let target = args.target.as_deref().map(Genotype::parse).transpose()?;
     let scores = Scores::default();
     let cfg = PlanConfig {
-        generations: args.generations.max(1),
-        carry: args.carry,
-        layer: LayerConfig { max_plants: args.plants, min_score: (args.min_score * 100.0).round() as i32, scores },
+        max_crossings: args.max_crossings,
+        max_plants: args.plants,
         target,
+        time_limit: Some(Duration::from_secs_f64(args.seconds)),
     };
 
     let mut backend: Box<dyn Backend> = if args.cpu { Box::new(CpuBackend) } else { Box::new(GpuBackend::new()?) };
     println!("Using {}", backend.name());
     let started = Instant::now();
     let outcome = run(&inputs, &cfg, backend.as_mut(), |s| {
-        println!(
-            "Generation {}: {} plants, {:.2e} groups, {} new genotypes, {:.2}s ({:.2e} groups/s)",
-            s.generation, s.pool, s.groups as f64, s.new_genotypes, s.seconds, s.groups as f64 / s.seconds.max(1e-9)
-        );
+        let note = if s.complete { "" } else { " (stopped by time limit)" };
+        println!("{} crossing(s): {} new genotypes, {} known, {:.2}s{note}", s.crossings, s.new_genotypes, s.pool, s.seconds);
     })?;
-    println!("Finished in {:.2}s, {} genotypes reached", started.elapsed().as_secs_f64(), outcome.recipes.len());
+    println!("Finished in {:.2}s. Every plant at up to {} crossing(s) has been searched exhaustively.", started.elapsed().as_secs_f64(), outcome.proven_up_to());
 
     let plans = match target {
         Some(t) if t.0 < GENOTYPES as u16 && outcome.inputs.contains(&t) => {
@@ -118,7 +113,7 @@ fn main() -> Result<()> {
         Some(t) => match outcome.plan(t) {
             Some(plan) => vec![plan],
             None => {
-                println!("{t} was not reached. Try more --generations, --carry or --plants.");
+                println!("{t} was not reached. Try more --seconds or --plants.");
                 Vec::new()
             }
         },

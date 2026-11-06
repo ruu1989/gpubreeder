@@ -15,14 +15,21 @@ cargo run --release -- --genes "WGXYYW,WGGXYW,WGYXGW" --target GGGYYY
 | `-g, --genes` | | Your plants, separated by spaces or commas |
 | `-f, --file` | | Read your plants from a file instead |
 | `-t, --target` | | Stop at this exact genotype |
-| `--generations` | 3 | Generations to search |
-| `--carry` | 200 | Most plants carried into each next generation |
+| `--max-crossings` | 12 | Most crossings to spend on one plant |
 | `--plants` | 5 | Most neighbours around a centre, 1 to 8 |
-| `--min-score` | 3.0 | Lowest score kept as a stepping stone |
+| `--seconds` | 60 | Stop searching after this long |
 | `--top` | 3 | Plans to print when there is no target |
 | `--cpu` | off | Use the CPU instead of the GPU |
 
-Work grows very quickly with `--plants` and `--carry`. Set `GPUBREEDER_TRACE=1` to see each batch.
+Work grows very quickly with `--plants`. Set `GPUBREEDER_TRACE=1` to see each batch.
+
+## How it searches
+
+The search runs cheapest-first. It finds everything one crossing can make, then everything two can
+make, and so on, so each genotype is settled at its cheapest cost. A plant costs the crossings
+needed to make it, and a crossing costs one plus the distinct plants it uses. Sub-plans shared by
+two branches are counted once per branch during the search, so a printed plan can be shorter than
+that price.
 
 ## How it stays correct
 

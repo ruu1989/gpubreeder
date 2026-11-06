@@ -7,12 +7,16 @@ struct Params {
     group_size: u32,
     pooled: u32,       // 1: one workgroup shares a prefix and adds two plants
     prefix_count: u32,
+    budget: u32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
 }
 
 const WANT_FREE: u32 = 0u;
 const CLAIMED: u32 = 2u;
 const NO_CENTRE: u32 = 0xFFFFFFFFu;
-const PREFIX_STRIDE: u32 = 11u;  // six packed slots, first id, four words of 16-bit ids
+const PREFIX_STRIDE: u32 = 12u;  // six packed slots, first id, four words of 16-bit ids, cost
 const RECIPE_STRIDE: u32 = 6u;   // four words of 16-bit ids, centre + 1, group size
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -27,6 +31,8 @@ const RECIPE_STRIDE: u32 = 6u;   // four words of 16-bit ids, centre + 1, group 
 // 65 offsets, then pool indexes. For each set of slots a centre can hold, only centres that
 // differ within those slots give different results, so only those are listed.
 @group(0) @binding(6) var<storage, read> centres: array<u32>;
+// Crossings needed to make each plant. The pool is sorted by this.
+@group(0) @binding(7) var<storage, read> costs: array<u32>;
 
 var<private> ids: array<u32, 8>;
 var<private> top: array<u32, 6>;
@@ -164,7 +170,29 @@ fn hopeless(slot: u32) -> bool {
     return top[slot] > 5u && (winners[slot] & allowed[slot]) == 0u;
 }
 
-fn leaf(c0: u32, c1: u32, c2: u32, c3: u32, c4: u32, c5: u32) {
+// Applies one centre to the group and tries the outcomes.
+fn with_centre(c: u32) {
+    for (var slot = 0u; slot < 6u; slot++) {
+        let bit = pool[c * 6u + slot];
+        // Red genes occupy the upper nibbles of the packed value.
+        let weight = select(3u, 5u, bit >= 4096u);
+        if weight >= top[slot] {
+            choices[slot] = 1u << (countTrailingZeros(bit) / 4u);
+        } else {
+            choices[slot] = winners[slot];
+        }
+    }
+    emit(c);
+}
+
+fn in_group(c: u32) -> bool {
+    for (var i = 0u; i < params.group_size; i++) {
+        if ids[i] == c { return true; }
+    }
+    return false;
+}
+
+fn leaf(c0: u32, c1: u32, c2: u32, c3: u32, c4: u32, c5: u32, spent: u32) {
     tally(0u, c0); if hopeless(0u) { return; }
     tally(1u, c1); if hopeless(1u) { return; }
     tally(2u, c2); if hopeless(2u) { return; }
@@ -176,6 +204,7 @@ fn leaf(c0: u32, c1: u32, c2: u32, c3: u32, c4: u32, c5: u32) {
         if top[slot] <= 5u { held |= 1u << slot; }
     }
     if held == 0u {
+        if spent != params.budget { return; }
         choices = winners;
         emit(NO_CENTRE);
         return;
@@ -183,17 +212,11 @@ fn leaf(c0: u32, c1: u32, c2: u32, c3: u32, c4: u32, c5: u32) {
     let end = centres[held + 1u];
     for (var at = centres[held]; at < end; at++) {
         let c = centres[65u + at];
-        for (var slot = 0u; slot < 6u; slot++) {
-            let bit = pool[c * 6u + slot];
-            // Red genes occupy the upper nibbles of the packed value.
-            let weight = select(3u, 5u, bit >= 4096u);
-            if weight >= top[slot] {
-                choices[slot] = 1u << (countTrailingZeros(bit) / 4u);
-            } else {
-                choices[slot] = winners[slot];
-            }
-        }
-        emit(c);
+        if !in_group(c) && spent + costs[c] == params.budget { with_centre(c); }
+    }
+    // A clone of a group member costs nothing extra, even if it isn't the listed centre.
+    if spent == params.budget {
+        for (var i = 0u; i < params.group_size; i++) { with_centre(ids[i]); }
     }
 }
 
@@ -222,16 +245,20 @@ fn main(
     let w1 = prefixes[base + 8u];
     let w2 = prefixes[base + 9u];
     let w3 = prefixes[base + 10u];
+    let paid = prefixes[base + 11u];
     ids[0] = w0 & 0xFFFFu; ids[1] = w0 >> 16u;
     ids[2] = w1 & 0xFFFFu; ids[3] = w1 >> 16u;
     ids[4] = w2 & 0xFFFFu; ids[5] = w2 >> 16u;
     ids[6] = w3 & 0xFFFFu; ids[7] = 0u;
 
     let n = params.pool_len;
+    let budget = params.budget;
     if shared_prefix {
         // The workgroup's threads deal the second-to-last plant out between themselves.
         let at = params.group_size - 2u;
         for (var a = first + local; a < n; a += WORKGROUP) {
+            let spent_a = paid + select(costs[a], 0u, a == first);
+            if spent_a > budget { break; }
             ids[at] = a;
             let i = a * 6u;
             let q0 = p0 + pool[i];
@@ -241,19 +268,23 @@ fn main(
             let q4 = p4 + pool[i + 4u];
             let q5 = p5 + pool[i + 5u];
             for (var b = a; b < n; b++) {
+                let spent_b = spent_a + select(costs[b], 0u, b == a);
+                if spent_b > budget { break; }
                 ids[at + 1u] = b;
                 let j = b * 6u;
                 leaf(q0 + pool[j], q1 + pool[j + 1u], q2 + pool[j + 2u],
-                     q3 + pool[j + 3u], q4 + pool[j + 4u], q5 + pool[j + 5u]);
+                     q3 + pool[j + 3u], q4 + pool[j + 4u], q5 + pool[j + 5u], spent_b);
             }
         }
     } else {
         let last = params.group_size - 1u;
         for (var a = first; a < n; a++) {
+            let spent_a = paid + select(costs[a], 0u, a == first);
+            if spent_a > budget { break; }
             ids[last] = a;
             let i = a * 6u;
             leaf(p0 + pool[i], p1 + pool[i + 1u], p2 + pool[i + 2u],
-                 p3 + pool[i + 3u], p4 + pool[i + 4u], p5 + pool[i + 5u]);
+                 p3 + pool[i + 3u], p4 + pool[i + 4u], p5 + pool[i + 5u], spent_a);
         }
     }
 }
