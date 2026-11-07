@@ -16,7 +16,7 @@ struct Params {
 const WANT_FREE: u32 = 0u;
 const CLAIMED: u32 = 2u;
 const NO_CENTRE: u32 = 0xFFFFFFFFu;
-const PREFIX_STRIDE: u32 = 12u;  // six packed slots, first id, four words of 16-bit ids, cost
+const PREFIX_STRIDE: u32 = 14u;  // six packed slots, first id, four words of 16-bit ids, cost, tail range
 const RECIPE_STRIDE: u32 = 6u;   // four words of 16-bit ids, centre + 1, group size
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -256,7 +256,8 @@ fn main(
     if shared_prefix {
         // The workgroup's threads deal the second-to-last plant out between themselves.
         let at = params.group_size - 2u;
-        for (var a = first + local; a < n; a += WORKGROUP) {
+        let stop = prefixes[base + 13u];
+        for (var a = prefixes[base + 12u] + local; a < stop; a += WORKGROUP) {
             let spent_a = paid + select(costs[a], 0u, a == first);
             if spent_a > budget { break; }
             ids[at] = a;
@@ -278,7 +279,8 @@ fn main(
         }
     } else {
         let last = params.group_size - 1u;
-        for (var a = first; a < n; a++) {
+        let stop = prefixes[base + 13u];
+        for (var a = prefixes[base + 12u]; a < stop; a++) {
             let spent_a = paid + select(costs[a], 0u, a == first);
             if spent_a > budget { break; }
             ids[last] = a;

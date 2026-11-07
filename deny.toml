@@ -1,0 +1,31 @@
+# cargo-deny: licences, security advisories and crate sources. CI runs `cargo deny check`.
+
+[graph]
+# The app is built for Windows and the command line for Windows and Linux.
+targets = ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"]
+
+[advisories]
+# Fail on known vulnerabilities anywhere, but on unmaintained crates only where we chose them
+# directly. Deep dependencies of Tauri and wgpu move when those projects update them.
+unmaintained = "workspace"
+ignore = []
+
+[licenses]
+confidence-threshold = 0.9
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

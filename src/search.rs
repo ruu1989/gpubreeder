@@ -5,9 +5,18 @@
 
 use crate::genes::*;
 use crate::rules::*;
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::time::Instant;
+
+/// Lets another thread watch a running search or stop it early.
+#[derive(Default)]
+pub struct SearchControl {
+    pub cancel: AtomicBool,
+    /// Neighbour groups checked so far.
+    pub groups: AtomicU64,
+}
 
 /// A group of plants found by a backend, not yet given an order.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -139,7 +148,16 @@ impl Backend for CpuBackend {
                     if request.costs[first] <= request.budget {
                         let mut ids = [0usize; MAX_NEIGHBOURS];
                         ids[0] = first;
-                        let walk = Walk { pool, costs: request.costs, budget: request.budget, packs: &packs, centres: &centres, table: &table, wanted: &remaining, size };
+                        let walk = Walk {
+                            pool,
+                            costs: request.costs,
+                            budget: request.budget,
+                            packs: &packs,
+                            centres: &centres,
+                            table: &table,
+                            wanted: &remaining,
+                            size,
+                        };
                         walk.descend(1, first, request.costs[first], packs[first], &mut ids, &mut best);
                     }
                     best
@@ -176,7 +194,15 @@ struct Walk<'a> {
 }
 
 impl Walk<'_> {
-    fn descend(&self, depth: usize, from: usize, spent: u32, counts: [u32; SLOTS], ids: &mut [usize; MAX_NEIGHBOURS], best: &mut [Option<Candidate>]) {
+    fn descend(
+        &self,
+        depth: usize,
+        from: usize,
+        spent: u32,
+        counts: [u32; SLOTS],
+        ids: &mut [usize; MAX_NEIGHBOURS],
+        best: &mut [Option<Candidate>],
+    ) {
         if depth == self.size {
             self.leaf(&ids[..depth], spent, counts, best);
             return;

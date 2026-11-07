@@ -3,14 +3,20 @@
 
 use crate::genes::*;
 use crate::rules::*;
+use crate::search::SearchControl;
 use crate::search::{Backend, Candidate, CpuBackend, LayerRequest, LayerResult};
-use anyhow::{anyhow, Result};
-use std::time::Instant;
+use anyhow::{Result, anyhow};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 const WANT_FREE: u32 = 0;
 const UNWANTED: u32 = 1;
 const CLAIMED: u32 = 2;
-const PREFIX_STRIDE: usize = 12;
+const PREFIX_STRIDE: usize = 14;
+/// Last plants one entry may try, for groups too small to share a prefix across a workgroup.
+/// Shared entries take one plant per thread instead.
+const TAIL_CHUNK: usize = 16;
 const RECIPE_STRIDE: usize = 6;
 const WORKGROUP: u32 = 64;
 /// The want buffer starts with one allowed-gene mask per slot, then one bit per genotype.
@@ -23,9 +29,49 @@ const DISPATCH_ROW: u32 = 65_535;
 /// From this group size up, a whole workgroup shares one prefix and adds two plants.
 const SHARED_FROM_SIZE: usize = 4;
 const MAX_POOL: usize = GENOTYPES;
-/// Long enough to keep the GPU busy, short enough to stay well clear of the watchdog.
-const TARGET_BATCH_SECONDS: f64 = 0.25;
+/// Windows resets the driver when one job holds the GPU for about 2 seconds, and a game sharing the
+/// card can stretch a job several times over. Keeping batches this short leaves room for that.
+const TARGET_BATCH_SECONDS: f64 = 0.05;
+const MAX_SIZE_TRYING_CENTRES: usize = 3;
+/// Batch sizes count `Job::group_work` units, not groups.
 const INITIAL_BATCH_GROUPS: f64 = 2e5;
+const MIN_BATCH_GROUPS: f64 = 1e4;
+/// Speed can fall 30 times over between batches, faster than measuring can react, so fast stretches
+/// can't be allowed to grow a batch past what the slowest stretches finish safely.
+const MAX_BATCH_GROUPS: f64 = 3e8;
+/// Batches grow slowly, because speed can fall sharply from one part of the search to the next.
+const BATCH_GROWTH: f64 = 1.5;
+/// Far beyond any healthy batch, and long enough to outlast a driver reset.
+const GPU_WAIT_LIMIT: Duration = Duration::from_secs(10);
+const POLL_INTERVAL: Duration = Duration::from_micros(200);
+
+/// The GPU stopped working mid-search, usually because the driver reset. This device is finished,
+/// so whoever holds it must start a new one.
+#[derive(Debug)]
+pub struct GpuFailure;
+
+impl std::fmt::Display for GpuFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "The GPU stopped responding during the search, usually because the graphics driver reset. Press Find plans to try again.",
+        )
+    }
+}
+
+impl std::error::Error for GpuFailure {}
+
+/// Picks the next batch size from how the last one went. A slow batch cuts straight to the
+/// measured speed, and only full batches can grow it.
+fn next_batch_budget(budget: f64, cost: f64, seconds: f64) -> f64 {
+    let next = if seconds > TARGET_BATCH_SECONDS {
+        budget.min(cost / seconds * TARGET_BATCH_SECONDS)
+    } else if cost >= budget * 0.5 {
+        budget * (TARGET_BATCH_SECONDS / seconds).min(BATCH_GROWTH)
+    } else {
+        budget
+    };
+    next.clamp(MIN_BATCH_GROUPS, MAX_BATCH_GROUPS)
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -38,11 +84,31 @@ struct Params {
     padding: [u32; 3],
 }
 
+const BACKENDS: wgpu::Backends = wgpu::Backends::VULKAN.union(wgpu::Backends::DX12);
+/// Picks a card by part of its name, for machines with more than one, or to test on a software
+/// renderer such as WARP ("Basic Render") or lavapipe ("llvmpipe").
+pub const ADAPTER_VARIABLE: &str = "GPUBREEDER_ADAPTER";
+
+/// Every card wgpu can use here, as "name (backend, type)".
+pub fn list_adapters() -> Vec<String> {
+    let instance =
+        wgpu::Instance::new(wgpu::InstanceDescriptor { backends: BACKENDS, ..wgpu::InstanceDescriptor::new_without_display_handle() });
+    pollster::block_on(instance.enumerate_adapters(BACKENDS))
+        .iter()
+        .map(|a| {
+            let i = a.get_info();
+            format!("{} ({:?}, {:?})", i.name, i.backend, i.device_type)
+        })
+        .collect()
+}
+
 pub struct GpuBackend {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
     adapter_name: String,
+    /// The card and driver in use, as wgpu reports them.
+    pub info: wgpu::AdapterInfo,
     params: wgpu::Buffer,
     pool: wgpu::Buffer,
     prefixes: wgpu::Buffer,
@@ -62,7 +128,10 @@ pub struct GpuBackend {
     batch_budget: f64,
     /// Group evaluations in the last `layer` call and the GPU time they took.
     pub last_groups: u64,
+    control: Arc<SearchControl>,
     pub last_seconds: f64,
+    /// Set by wgpu when the device dies or reports an error.
+    failed: Arc<AtomicBool>,
 }
 
 fn storage(device: &wgpu::Device, label: &str, size: u64, usage: wgpu::BufferUsages) -> wgpu::Buffer {
@@ -71,21 +140,35 @@ fn storage(device: &wgpu::Device, label: &str, size: u64, usage: wgpu::BufferUsa
 
 impl GpuBackend {
     pub fn new() -> Result<Self> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN | wgpu::Backends::DX12,
-            ..wgpu::InstanceDescriptor::new_without_display_handle()
-        });
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            ..Default::default()
-        }))
-        .map_err(|e| anyhow!("no usable GPU: {e}"))?;
-        let adapter_name = format!("{} ({:?})", adapter.get_info().name, adapter.get_info().backend);
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor { backends: BACKENDS, ..wgpu::InstanceDescriptor::new_without_display_handle() });
+        let adapter = match std::env::var(ADAPTER_VARIABLE) {
+            Ok(wanted) if !wanted.is_empty() => {
+                let all = pollster::block_on(instance.enumerate_adapters(BACKENDS));
+                let names: Vec<String> = all.iter().map(|a| a.get_info().name).collect();
+                all.into_iter()
+                    .find(|a| a.get_info().name.to_lowercase().contains(&wanted.to_lowercase()))
+                    .ok_or_else(|| anyhow!("{ADAPTER_VARIABLE}={wanted} matches none of: {}", names.join(", ")))?
+            }
+            _ => pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                ..Default::default()
+            }))
+            .map_err(|e| anyhow!("no usable GPU: {e}"))?,
+        };
+        let info = adapter.get_info();
+        let adapter_name = format!("{} ({:?})", info.name, info.backend);
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("gpubreeder"),
             required_limits: adapter.limits(),
             ..Default::default()
         }))?;
+        let failed = Arc::new(AtomicBool::new(false));
+        let lost = failed.clone();
+        device.set_device_lost_callback(move |_, _| lost.store(true, Ordering::SeqCst));
+        // Without this handler wgpu panics on the search thread.
+        let errored = failed.clone();
+        device.on_uncaptured_error(Arc::new(move |_| errored.store(true, Ordering::SeqCst)));
 
         let shader = unsafe {
             // Indexes are all derived from buffer sizes set here, and bounds checks cost real
@@ -138,6 +221,7 @@ impl GpuBackend {
             queue,
             pipeline,
             adapter_name,
+            info,
             params,
             pool,
             prefixes,
@@ -154,13 +238,37 @@ impl GpuBackend {
             bind_group,
             batch_budget: INITIAL_BATCH_GROUPS,
             last_groups: 0,
+            control: Arc::default(),
             last_seconds: 0.0,
+            failed,
         })
     }
 
+    pub fn control(&self) -> Arc<SearchControl> {
+        self.control.clone()
+    }
+
+    /// Polls until `done`, giving up if the GPU fails or goes quiet. Blocking waits can't be used
+    /// here, because after a driver reset they may never return.
+    fn settle(&self, mut done: impl FnMut(wgpu::PollStatus) -> bool) -> Result<()> {
+        let started = Instant::now();
+        loop {
+            let status = self.device.poll(wgpu::PollType::Poll).map_err(|_| GpuFailure)?;
+            if self.failed.load(Ordering::SeqCst) {
+                return Err(GpuFailure.into());
+            }
+            if done(status) {
+                return Ok(());
+            }
+            if started.elapsed() > GPU_WAIT_LIMIT {
+                return Err(GpuFailure.into());
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+
     fn wait(&self) -> Result<()> {
-        self.device.poll(wgpu::PollType::wait_indefinitely()).map_err(|e| anyhow!("GPU wait failed: {e:?}"))?;
-        Ok(())
+        self.settle(|status| status.is_queue_empty())
     }
 
     fn dispatch(&self, prefix_data: &[u32], params: Params) -> Result<()> {
@@ -192,9 +300,13 @@ impl GpuBackend {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = sender.send(result);
         });
-        self.wait()?;
-        receiver.recv()?.map_err(|e| anyhow!("GPU readback failed: {e:?}"))?;
-        let data = slice.get_mapped_range().map_err(|e| anyhow!("GPU readback failed: {e:?}"))?;
+        let mut mapped = None;
+        self.settle(|_| {
+            mapped = receiver.try_recv().ok();
+            mapped.is_some()
+        })?;
+        mapped.ok_or(GpuFailure)?.map_err(|_| GpuFailure)?;
+        let data = slice.get_mapped_range().map_err(|_| GpuFailure)?;
         let words: &[u32] = bytemuck::cast_slice(&data);
         let claims = words[..GENOTYPES].to_vec();
         let recipes = words[GENOTYPES..].to_vec();
@@ -251,46 +363,73 @@ impl GpuBackend {
         }
         let trace = std::env::var_os("GPUBREEDER_TRACE").is_some();
         let started = Instant::now();
-        let params = Params { pool_len: job.pool_len as u32, group_size: job.size as u32, shared: u32::from(job.shared()), prefix_count: entries as u32, budget: job.budget, padding: [0; 3] };
+        let params = Params {
+            pool_len: job.pool_len as u32,
+            group_size: job.size as u32,
+            shared: u32::from(job.shared()),
+            prefix_count: entries as u32,
+            budget: job.budget,
+            padding: [0; 3],
+        };
         self.dispatch(batch, params)?;
         let seconds = started.elapsed().as_secs_f64().max(1e-4);
         if trace {
-            eprintln!("size {} n {}: {entries} prefixes, cost {cost:.3e}, budget {:.3e}, {seconds:.3}s", job.size, job.pool_len, self.batch_budget);
+            eprintln!(
+                "size {} n {}: {entries} prefixes, cost {cost:.3e}, budget {:.3e}, {seconds:.3}s",
+                job.size, job.pool_len, self.batch_budget
+            );
         }
         self.last_groups += *cost as u64;
+        self.control.groups.fetch_add(*cost as u64, Ordering::Relaxed);
         self.last_seconds += seconds;
-        // Only full batches say anything about speed.
-        if *cost >= self.batch_budget * 0.5 {
-            let scale = (TARGET_BATCH_SECONDS / seconds).clamp(0.25, 4.0);
-            self.batch_budget = (self.batch_budget * scale).clamp(1e6, 2e12);
-        }
+        self.batch_budget = next_batch_budget(self.batch_budget, *cost * job.group_work(), seconds);
         batch.clear();
         *cost = 0.0;
-        self.timed_out |= self.deadline.is_some_and(|d| Instant::now() >= d);
+        self.timed_out |= self.deadline.is_some_and(|d| Instant::now() >= d) || self.control.cancel.load(Ordering::Relaxed);
         self.refresh_wanted()
     }
 
     /// Lists every useful group prefix, depth first, dispatching as batches fill.
     #[allow(clippy::too_many_arguments)]
-    fn walk(&mut self, job: &Job, depth: usize, from: usize, spent: u32, counts: [u32; SLOTS], ids: &mut [usize; MAX_NEIGHBOURS], batch: &mut Vec<u32>, cost: &mut f64) -> Result<()> {
+    fn walk(
+        &mut self,
+        job: &Job,
+        depth: usize,
+        from: usize,
+        spent: u32,
+        counts: [u32; SLOTS],
+        ids: &mut [usize; MAX_NEIGHBOURS],
+        batch: &mut Vec<u32>,
+        cost: &mut f64,
+    ) -> Result<()> {
         if self.nothing_wanted || self.timed_out {
             return Ok(());
         }
         if depth == job.prefix_len() {
-            batch.extend_from_slice(&counts);
             let first = ids[depth - 1];
-            batch.push(first as u32);
             let mut words = [0u32; 4];
             for (i, &id) in ids[..depth].iter().enumerate() {
                 words[i / 2] |= (id as u32) << (16 * (i % 2));
             }
-            batch.extend_from_slice(&words);
-            batch.push(spent);
             let reach = job.costs.partition_point(|&c| c <= job.budget - spent).max(first + 1);
-            let tail = (reach - first) as f64;
-            *cost += if job.shared() { tail * (tail + 1.0) / 2.0 } else { tail };
-            if *cost >= self.batch_budget || batch.len() / PREFIX_STRIDE >= MAX_PREFIXES {
-                self.flush(job, batch, cost)?;
+            // One entry runs on one GPU thread, and with a whole pool of centres to try it can
+            // run past the watchdog alone. Splitting it also lets the GPU work on it in parallel.
+            let chunk = if job.shared() { WORKGROUP as usize } else { TAIL_CHUNK };
+            let mut start = first;
+            while start < reach && !self.nothing_wanted && !self.timed_out {
+                let stop = (start + chunk).min(reach);
+                batch.extend_from_slice(&counts);
+                batch.push(first as u32);
+                batch.extend_from_slice(&words);
+                batch.push(spent);
+                batch.extend_from_slice(&[start as u32, stop as u32]);
+                let tail = (stop - start) as f64;
+                // A shared entry pairs each plant in its range with every plant after it.
+                *cost += if job.shared() { tail * (reach - start + reach - stop + 1) as f64 / 2.0 } else { tail };
+                if *cost * job.group_work() >= self.batch_budget || batch.len() / PREFIX_STRIDE >= MAX_PREFIXES {
+                    self.flush(job, batch, cost)?;
+                }
+                start = stop;
             }
             return Ok(());
         }
@@ -315,8 +454,9 @@ impl GpuBackend {
     /// Runs all groups of one size.
     fn run_size(&mut self, packs: &[[u32; SLOTS]], costs: &[u32], budget: u32, size: usize) -> Result<()> {
         let job = Job { packs, costs, budget, pool_len: packs.len(), size };
-        // Speed differs a lot between sizes because small groups try every centre.
-        self.batch_budget = INITIAL_BATCH_GROUPS;
+        // Speed differs a lot between sizes because small groups try every centre. Never start a
+        // size above what the GPU just managed, since it may be busy with something else.
+        self.batch_budget = self.batch_budget.min(INITIAL_BATCH_GROUPS);
         let mut batch: Vec<u32> = Vec::with_capacity(MAX_PREFIXES * PREFIX_STRIDE);
         let mut cost = 0f64;
         let mut ids = [0usize; MAX_NEIGHBOURS];
@@ -341,6 +481,12 @@ impl Job<'_> {
 
     fn prefix_len(&self) -> usize {
         self.size - if self.shared() { 2 } else { 1 }
+    }
+
+    /// Rough GPU work per group. Up to three plants rarely beat a centre's weight in every slot,
+    /// so each group tries most of the pool as its centre. Larger groups almost never do.
+    fn group_work(&self) -> f64 {
+        if self.size <= MAX_SIZE_TRYING_CENTRES { self.pool_len as f64 } else { 1.0 }
     }
 }
 
@@ -378,6 +524,7 @@ impl Backend for GpuBackend {
         self.last_seconds = 0.0;
         self.deadline = request.deadline;
         self.timed_out = false;
+        self.batch_budget = INITIAL_BATCH_GROUPS;
 
         // Single neighbours are trivial, and leave only sizes that fit the prefix scheme.
         let mut found = CpuBackend.layer(&LayerRequest { max_plants: 1, deadline: None, ..*request })?.found;
@@ -404,6 +551,11 @@ impl Backend for GpuBackend {
         }
 
         let (claims, recipes) = self.read_results()?;
+        // A reset can wipe GPU memory without an error, and an empty result would read as proof
+        // that nothing was reachable. Plants nobody asked for must still be marked as such.
+        if (0..GENOTYPES).any(|i| claims[i] > CLAIMED || (!still_wanted[i] && claims[i] != UNWANTED)) {
+            return Err(GpuFailure.into());
+        }
         for index in 0..GENOTYPES {
             if claims[index] != CLAIMED {
                 continue;
@@ -429,64 +581,46 @@ impl Backend for GpuBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::search::{confirm, CpuBackend};
-    use std::collections::BTreeMap;
-
-    /// Settles genotypes round by round, as the planner does. Returns each one's price.
-    fn settle(backend: &mut dyn Backend, inputs: &[Genotype], max_plants: usize, rounds: u32) -> BTreeMap<Genotype, (u32, usize)> {
-        let mut known = vec![false; GENOTYPES];
-        inputs.iter().for_each(|g| known[g.0 as usize] = true);
-        let mut pool = inputs.to_vec();
-        let mut costs = vec![0u32; pool.len()];
-        let mut out = BTreeMap::new();
-        for budget in 0..rounds {
-            let wanted: Vec<bool> = known.iter().map(|k| !k).collect();
-            let result = backend.layer(&LayerRequest { pool: &pool, costs: &costs, wanted: &wanted, max_plants, budget, deadline: None }).unwrap();
-            assert!(result.complete);
-            for (g, candidate) in result.found {
-                confirm(g, &candidate).unwrap();
-                known[g.0 as usize] = true;
-                out.insert(g, (budget + 1, candidate.plants.len()));
-                pool.push(g);
-                costs.push(budget + 1);
-            }
-        }
-        out
-    }
-
-    fn compare(inputs: &[Genotype], max_plants: usize, rounds: u32) {
-        let mut gpu_backend = GpuBackend::new().expect("GPU required for this test");
-        let gpu = settle(&mut gpu_backend, inputs, max_plants, rounds);
-        let cpu = settle(&mut CpuBackend, inputs, max_plants, rounds);
-        let gpu_prices: BTreeMap<_, _> = gpu.iter().map(|(g, v)| (*g, v.0)).collect();
-        let cpu_prices: BTreeMap<_, _> = cpu.iter().map(|(g, v)| (*g, v.0)).collect();
-        assert_eq!(gpu_prices, cpu_prices, "inputs {inputs:?}");
-    }
+    use crate::selftest;
 
     #[test]
-    fn gpu_matches_cpu_on_sample_sets() {
-        for text in [
-            "WGXYYW WGGXYW WGYXGW WYYXGW XYYXGW XYGXYW YWGYGX WGGWYX XGYWGG XGYWYX WYYWGW XYYGWX YXGWGX WYGXYW WGWGYW WYWXGG XYGWGW WGYWGW XYYWYW XYGWYX XYGXYX WGGXYX XYGWYW",
-            "GGGYYH YGGYYH YHGYHH HGGGYH HHGGYH WGHYYY WGGYYY HWYGGH GHYXGH YGYXYH GYYXHH GHGWYH HGGGYW HHGHYW WGGGYY XHHGGH",
-        ] {
-            compare(&parse_list(text).unwrap(), 8, 1);
-            compare(&parse_list(text).unwrap(), 4, 3);
-        }
+    fn a_slow_batch_shrinks_at_once_and_growth_stays_gentle() {
+        let budget = 1e8;
+        // A game takes the card, and the same work runs 20 times slower.
+        assert_eq!(next_batch_budget(budget, budget, 1.0), budget * TARGET_BATCH_SECONDS);
+        // A fast batch can't grow the next one enough to reach the watchdog.
+        assert_eq!(next_batch_budget(budget, budget, 0.001), budget * BATCH_GROWTH);
+        // A short end-of-size batch says nothing about speed, unless it was slow.
+        assert_eq!(next_batch_budget(budget, 1e3, 0.001), budget);
+        assert!(next_batch_budget(budget, 1e3, 0.5) < budget);
+        // A stalled batch can't push the size to nothing.
+        assert_eq!(next_batch_budget(budget, 1.0, 2.0), MIN_BATCH_GROUPS);
+        // However fast it has been going, a batch stays under the ceiling.
+        assert_eq!(next_batch_budget(MAX_BATCH_GROUPS, MAX_BATCH_GROUPS, 0.001), MAX_BATCH_GROUPS);
     }
 
+    /// Runs no compute, so it's safe beside a game.
     #[test]
-    fn gpu_matches_cpu_on_random_pools() {
-        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
-        let mut next = move || {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed
-        };
-        for trial in 0..30 {
-            let size = 2 + trial % 7;
-            let pool: Vec<Genotype> = (0..size).map(|_| Genotype((next() % GENOTYPES as u64) as u16)).collect();
-            compare(&pool, 1 + trial % 8, 1 + (trial % 3) as u32);
+    fn a_lost_gpu_is_reported_and_never_hangs() {
+        let mut backend = GpuBackend::new().expect("GPU required for this test");
+        backend.device.destroy();
+        let inputs = parse_list("GGGYYH XGHGWY HGGGYH").unwrap();
+        let costs = vec![0; inputs.len()];
+        let wanted = vec![true; GENOTYPES];
+        let started = Instant::now();
+        let result =
+            backend.layer(&LayerRequest { pool: &inputs, costs: &costs, wanted: &wanted, max_plants: 5, budget: 0, deadline: None });
+        assert!(result.err().is_some_and(|e| e.is::<GpuFailure>()));
+        assert!(started.elapsed() < GPU_WAIT_LIMIT * 2);
+        std::mem::forget(backend);
+    }
+
+    /// The same cases `gpubreeder --selftest` runs.
+    #[test]
+    fn gpu_matches_cpu() {
+        let mut gpu = GpuBackend::new().expect("GPU required for this test");
+        for case in selftest::cases() {
+            assert_eq!(selftest::compare(&mut gpu, &case).unwrap(), None, "{}", case.name);
         }
     }
 }

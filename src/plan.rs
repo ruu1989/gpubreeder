@@ -3,17 +3,43 @@
 use crate::genes::*;
 use crate::rules::*;
 use crate::search::*;
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration, Instant};
+
+/// What a search is trying to make.
+#[derive(Clone, Copy, Debug)]
+pub enum Goal {
+    Exact(Genotype),
+    /// Any plant with these gene counts, in any slots.
+    Mix(GeneMix),
+}
+
+impl Goal {
+    pub fn matches(self, g: Genotype) -> bool {
+        match self {
+            Goal::Exact(want) => want == g,
+            Goal::Mix(mix) => mix.matches(g),
+        }
+    }
+}
+
+impl std::fmt::Display for Goal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Goal::Exact(g) => write!(f, "{g}"),
+            Goal::Mix(mix) => write!(f, "{mix}"),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct PlanConfig {
     /// Stop after this many crossings per plant.
     pub max_crossings: u32,
     pub max_plants: usize,
-    pub target: Option<Genotype>,
+    pub goal: Option<Goal>,
     pub time_limit: Option<Duration>,
 }
 
@@ -66,7 +92,8 @@ pub fn run(inputs: &[Genotype], cfg: &PlanConfig, backend: &mut dyn Backend, mut
     for budget in 0..cfg.max_crossings {
         let started = Instant::now();
         let wanted: Vec<bool> = known.iter().map(|k| !k).collect();
-        let result = backend.layer(&LayerRequest { pool: &pool, costs: &costs, wanted: &wanted, max_plants: cfg.max_plants, budget, deadline })?;
+        let result =
+            backend.layer(&LayerRequest { pool: &pool, costs: &costs, wanted: &wanted, max_plants: cfg.max_plants, budget, deadline })?;
         let recipes: Vec<Recipe> = result.found.par_iter().map(|(g, c)| confirm(*g, c)).collect::<Result<_>>()?;
         let new_genotypes = recipes.len();
         for recipe in recipes {
@@ -79,12 +106,18 @@ pub fn run(inputs: &[Genotype], cfg: &PlanConfig, backend: &mut dyn Backend, mut
             costs.push(budget + 1);
             outcome.reached.insert(result, Entry { cost: budget + 1, generation, recipe });
         }
-        let stats = RoundStats { crossings: budget + 1, pool: pool.len(), new_genotypes, complete: result.complete, seconds: started.elapsed().as_secs_f64() };
+        let stats = RoundStats {
+            crossings: budget + 1,
+            pool: pool.len(),
+            new_genotypes,
+            complete: result.complete,
+            seconds: started.elapsed().as_secs_f64(),
+        };
         progress(&stats);
         outcome.stats.push(stats);
 
-        let target_done = cfg.target.is_some_and(|t| outcome.reached.contains_key(&t));
-        if target_done || !result.complete || known.iter().all(|&k| k) {
+        let goal_done = cfg.goal.is_some_and(|goal| outcome.reached.keys().any(|&g| goal.matches(g)));
+        if goal_done || !result.complete || known.iter().all(|&k| k) {
             break;
         }
     }
@@ -92,6 +125,7 @@ pub fn run(inputs: &[Genotype], cfg: &PlanConfig, backend: &mut dyn Backend, mut
 }
 
 /// A complete plan, parents first.
+#[derive(Clone)]
 pub struct Plan {
     pub goal: Genotype,
     pub generation: u32,
@@ -128,7 +162,16 @@ impl Outcome {
     /// Best results: highest score, then fewest crossings, then fewest generations.
     pub fn best(&self, scores: &Scores, count: usize) -> Vec<Plan> {
         let top = self.reached.keys().map(|g| g.score(scores)).max().unwrap_or(0);
-        let goals = self.reached.keys().copied().filter(|g| g.score(scores) == top);
+        self.ranked(|g| g.score(scores) == top, count)
+    }
+
+    /// Reached plants meeting a goal, fewest crossings first.
+    pub fn meeting(&self, goal: Goal, count: usize) -> Vec<Plan> {
+        self.ranked(|g| goal.matches(g), count)
+    }
+
+    fn ranked(&self, keep: impl Fn(Genotype) -> bool, count: usize) -> Vec<Plan> {
+        let goals = self.reached.keys().copied().filter(|&g| keep(g));
         let mut plans: Vec<Plan> = goals.filter_map(|g| self.plan(g)).collect();
         plans.sort_by_key(|p| (p.steps.len(), p.generation, p.goal));
         plans.truncate(count);
@@ -171,8 +214,8 @@ pub fn order_matters(recipe: &Recipe) -> bool {
 mod tests {
     use super::*;
 
-    fn config(max_crossings: u32, target: Option<Genotype>) -> PlanConfig {
-        PlanConfig { max_crossings, max_plants: 3, target, time_limit: None }
+    fn config(max_crossings: u32, goal: Option<Goal>) -> PlanConfig {
+        PlanConfig { max_crossings, max_plants: 3, goal, time_limit: None }
     }
 
     const SMALL: &str = "GGGYYH XGHGWY HGGGYH YGHWGX WGGYYY";
@@ -199,7 +242,7 @@ mod tests {
     #[test]
     fn prices_are_the_true_minimum() {
         let inputs = parse_list("GGGGGY YYYYYW").unwrap();
-        let outcome = run(&inputs, &PlanConfig { max_crossings: 3, max_plants: 3, target: None, time_limit: None }, &mut CpuBackend, |_| {}).unwrap();
+        let outcome = run(&inputs, &config(3, None), &mut CpuBackend, |_| {}).unwrap();
 
         // Bellman-Ford over the reference simulation: cost of a crossing is its distinct parents.
         let mut best: BTreeMap<Genotype, u32> = inputs.iter().map(|g| (*g, 0)).collect();
@@ -241,8 +284,39 @@ mod tests {
         let inputs = parse_list(SMALL).unwrap();
         let outcome = run(&inputs, &config(1, None), &mut CpuBackend, |_| {}).unwrap();
         let target = *outcome.reached.keys().next().unwrap();
-        let focused = run(&inputs, &config(5, Some(target)), &mut CpuBackend, |_| {}).unwrap();
+        let focused = run(&inputs, &config(5, Some(Goal::Exact(target))), &mut CpuBackend, |_| {}).unwrap();
         assert_eq!(focused.stats.len(), 1);
         assert!(focused.plan(target).is_some());
+    }
+
+    /// A mix must take the cheapest arrangement, even when the one a person might have typed
+    /// costs more.
+    #[test]
+    fn a_mix_stops_at_its_cheapest_arrangement() {
+        let inputs = parse_list(SMALL).unwrap();
+        let outcome = run(&inputs, &config(3, None), &mut CpuBackend, |_| {}).unwrap();
+        let reached: Vec<&Entry> = outcome.reached.values().collect();
+        let dearest = reached.iter().find(|e| e.cost >= 2).expect("a two-crossing plant");
+        let genes = dearest.recipe.result.genes();
+        let mut counts = [0u8; GENE_KINDS];
+        genes.iter().for_each(|&g| counts[g as usize] += 1);
+        let mix = GeneMix(counts);
+        let cheapest = reached.iter().filter(|e| mix.matches(e.recipe.result)).map(|e| e.cost).min().unwrap();
+
+        let focused = run(&inputs, &config(3, Some(Goal::Mix(mix))), &mut CpuBackend, |_| {}).unwrap();
+        let plans = focused.meeting(Goal::Mix(mix), 50);
+        assert!(!plans.is_empty());
+        for plan in &plans {
+            assert!(mix.matches(plan.goal));
+            assert_eq!(focused.reached[&plan.goal].cost, cheapest);
+            plan.check(&focused.inputs).unwrap();
+        }
+    }
+
+    #[test]
+    fn an_exact_goal_does_not_accept_a_rearrangement() {
+        let goal = Goal::Exact(Genotype::parse("GGGYYY").unwrap());
+        assert!(!goal.matches(Genotype::parse("GYGYGY").unwrap()));
+        assert!(Goal::Mix(GeneMix::parse("3G3Y").unwrap()).matches(Genotype::parse("GYGYGY").unwrap()));
     }
 }

@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  # Runners have no GPU, so the GPU tests run on software renderers: WARP on Windows and lavapipe
+  # on Linux. They catch kernel and search bugs, not quirks of real drivers. Users can run
+  # `gpubreeder --selftest` on their own cards for that.
+  test-windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      GPUBREEDER_ADAPTER: Basic Render
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node --test app/tests/scan.test.cjs
+      - run: cargo test --workspace --release --locked -- --test-threads=1
+
+  test-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      GPUBREEDER_ADAPTER: llvmpipe
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install lavapipe, a software Vulkan driver
+        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
+      - run: cargo test -p gpubreeder --release --locked -- --test-threads=1
+
+  dependencies:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: EmbarkStudios/cargo-deny-action@v2

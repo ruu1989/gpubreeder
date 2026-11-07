@@ -34,7 +34,14 @@ fn half_score(g: usize) -> i32 {
     Genotype(g as u16).score(&Scores::default()) / 50
 }
 
-fn evaluate(site: &mut Site, plants: &[Genotype], centre: Option<Genotype>, slots: &[SlotResult; SLOTS], sources: &HashSet<Genotype>, generation: usize) {
+fn evaluate(
+    site: &mut Site,
+    plants: &[Genotype],
+    centre: Option<Genotype>,
+    slots: &[SlotResult; SLOTS],
+    sources: &HashSet<Genotype>,
+    generation: usize,
+) {
     let centre_genes = centre.map(Genotype::genes);
     let mut results = vec![[0u8; SLOTS]];
     let mut ties = 0;
@@ -188,7 +195,9 @@ fn site_rows(text: &str) -> String {
         }
     }
     let mut rows: Vec<String> = (0..GENOTYPES)
-        .filter_map(|i| site.best[i].as_ref().map(|f| format!("{},{},{},{}", Genotype(i as u16), half_score(i) as f32 / 2.0, f.chance, f.generation)))
+        .filter_map(|i| {
+            site.best[i].as_ref().map(|f| format!("{},{},{},{}", Genotype(i as u16), half_score(i) as f32 / 2.0, f.chance, f.generation))
+        })
         .collect();
     rows.sort();
     rows.join(";")

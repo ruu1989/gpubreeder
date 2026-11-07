@@ -1,7 +1,14 @@
+[workspace]
+members = ["app"]
+
 [package]
 name = "gpubreeder"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "Finds crossbreeding plans for plants in Rust (the game) on your GPU, using the game's exact rules."
+license = "MIT"
+publish = false
 
 [dependencies]
 anyhow = "1.0.104"
@@ -9,4 +16,5 @@ bytemuck = { version = "1.25.2", features = ["derive"] }
 clap = { version = "4.6.7", features = ["derive"] }
 pollster = "1.0.1"
 rayon = "1.12.0"
+serde = { version = "1", features = ["derive"] }
 wgpu = "30.0.1"

@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>GPUBreeder</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app">
+  <nav class="rail">
+    <div class="brand" aria-hidden="true"><i class="g"></i><i class="g"></i><i class="y"></i><i class="y"></i><i class="g"></i><i class="w"></i></div>
+    <button class="nav active" data-view="breed"><b>Breed</b><span>Find a plan</span></button>
+    <button class="nav" data-view="guide"><b>Guide</b><span id="navGuide">No plan yet</span></button>
+    <button class="nav" data-view="times"><b>Grow times</b><span>All crops</span></button>
+    <div class="railfoot">
+      <p>GPUBreeder never touches the game process. Scanning only sees the window you share, and sends no input.</p>
+      <p class="credit">Built on the work of <button class="linkish" id="credit">Rust Breeder</button> by Wojciech Słodziak. Unofficial, not made by Facepunch.</p>
+    </div>
+  </nav>
+
+  <main>
+    <section class="view" id="view-breed">
+      <header class="top">
+        <h1>Find the shortest route to your plant</h1>
+        <p>Every plan is replayed against the game's real rules before it's shown.</p>
+      </header>
+
+      <div class="columns">
+        <div class="stack">
+          <article class="panel">
+            <div class="panel-head">
+              <h2>Your clones</h2>
+              <button class="ghost" id="scanHere">Scan clones</button>
+            </div>
+            <p class="hint" id="scanNote" hidden></p>
+            <textarea id="paste" spellcheck="false" placeholder="Paste from Rust Breeder, one plant per line&#10;GGYYWH&#10;XGHGWY"></textarea>
+            <div class="chips" id="plants"></div>
+            <p class="hint" id="lastClone" hidden></p>
+            <p class="warn" id="ignored" hidden></p>
+            <button class="linkish" id="scan">Or use Rust Breeder's scanner</button>
+          </article>
+
+          <article class="panel">
+            <div class="panel-head"><h2>Target genes</h2><span class="tag" id="mixState">in any slots</span></div>
+            <div class="mix" id="mix"></div>
+            <div class="presets" id="presets"></div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-head"><h2>Growing setup</h2></div>
+            <div class="form">
+              <label>Crop <select id="crop"></select></label>
+              <label>Neighbours, up to <select id="neighbours"><option>3</option><option>4</option><option selected>5</option><option>6</option><option>7</option><option>8</option></select></label>
+              <label>Search for <select id="seconds"><option value="30">30 seconds</option><option value="60" selected>1 minute</option><option value="180">3 minutes</option><option value="600">10 minutes</option></select></label>
+              <label class="check"><input type="checkbox" id="fertilized" checked> Fertilised planter</label>
+              <label class="wide">Light, water and heat quality <output id="qualityOut">100%</output><input type="range" id="quality" min="10" max="100" value="100"></label>
+              <p class="hint wide" id="health"></p>
+            </div>
+          </article>
+        </div>
+
+        <div class="stack grow">
+          <button class="go" id="go">Find plans</button>
+          <p class="error" id="error" hidden></p>
+          <article class="panel" id="roundsPanel" hidden>
+            <div class="panel-head"><h2>Search</h2><span class="tag" id="searchTime"></span></div>
+            <div class="searchclock" id="searchClock" hidden>
+              <div class="bar"><i id="searchBar"></i></div>
+              <span class="timerlabel" id="searchLeft"></span>
+            </div>
+            <ol class="rounds" id="rounds"></ol>
+            <p class="summary" id="searchNote"></p>
+          </article>
+          <div class="sortbar" id="sortbar" hidden>
+            <span>Sort by</span>
+            <button data-sort="safe" class="seg active">Fewest order-sensitive steps</button>
+            <button data-sort="fast" class="seg">Fastest</button>
+          </div>
+          <div class="plans" id="plans">
+            <div class="empty" id="emptyPlans">
+              <h3>Plans appear here</h3>
+              <p>Paste your clones, pick the genes you want, and press Find plans.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="view" id="view-guide" hidden>
+      <div class="empty" id="guideEmpty"><h3>No plan running</h3><p>Pick a plan on the Breed tab and press Start guide.</p></div>
+      <div id="guide" hidden>
+        <div class="stagewrap">
+          <div class="track" id="track"></div>
+          <!-- The live controls move into whichever cue is current. -->
+          <div class="live" id="live">
+            <div class="timer" id="timerBox" hidden>
+              <span class="clock" id="clock">0:00</span>
+              <div class="bar"><i id="timerBar"></i></div>
+              <span class="timerlabel" id="timerLabel"></span>
+            </div>
+            <p class="error" id="deadline" hidden></p>
+            <div class="actions" id="actions"></div>
+          </div>
+          <div class="side">
+            <article class="panel">
+              <div class="panel-head"><h2>Planter</h2></div>
+              <div class="planter" id="planter"></div>
+              <p class="hint">Every plant must sit within 1.5 m of the centre.</p>
+            </article>
+            <article class="panel">
+              <div class="panel-head"><h2>While you play</h2></div>
+              <label class="check"><input type="checkbox" id="optVoice" checked> Say cues out loud</label>
+              <label class="check"><input type="checkbox" id="optChime" checked> Chime</label>
+              <label class="check"><input type="checkbox" id="optTop"> Keep this window on top</label>
+              <label class="check"><input type="checkbox" id="optHotkey" checked> F9 confirms the current cue</label>
+              <button class="ghost" id="testSound">Test sound</button>
+            </article>
+            <article class="panel">
+              <div class="panel-head"><h2>Progress</h2><button class="ghost" id="quitGuide">End guide</button></div>
+              <ol class="steps" id="stepList"></ol>
+              <ul class="notes" id="guideNotes"></ul>
+            </article>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="view" id="view-times" hidden>
+      <header class="top">
+        <h1>Actual grow times</h1>
+        <p id="timesNote"></p>
+      </header>
+      <div class="timesgrid" id="times"></div>
+    </section>
+  </main>
+
+  <aside class="telemetry">
+    <div class="gpuname" id="gpuName">Waiting for GPU</div>
+    <div class="ring"><svg viewBox="0 0 120 120" aria-hidden="true"><circle class="track" cx="60" cy="60" r="52"/><circle class="value" id="ring" cx="60" cy="60" r="52"/></svg><div><b id="util">–</b><span>GPU load</span></div></div>
+    <div class="speed"><b id="speed">idle</b><span>neighbour groups per second</span></div>
+    <canvas id="spark" width="460" height="120"></canvas>
+    <dl class="stats">
+      <div><dt>Temperature</dt><dd id="temp">–</dd></div>
+      <div><dt>Power</dt><dd id="power">–</dd></div>
+      <div><dt>Core clock</dt><dd id="core">–</dd></div>
+      <div><dt>Memory clock</dt><dd id="mem">–</dd></div>
+      <div><dt>Fan</dt><dd id="fan">–</dd></div>
+      <div><dt>VRAM</dt><dd id="vram">–</dd></div>
+    </dl>
+    <div class="vram"><i id="vramBar"></i></div>
+    <div class="bench">
+      <button class="ghost" id="bench">Benchmark</button>
+      <p class="hint" id="benchNote">Measures this card's top speed in about 10 seconds. Close games first for a fair number.</p>
+    </div>
+    <p class="hint">Searches run in short bursts so they can share the card with a game, but expect lower frames while one runs.</p>
+  </aside>
+</div>
+<script src="scan.js"></script>
+<script src="scan-templates.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

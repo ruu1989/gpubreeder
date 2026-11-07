@@ -1,0 +1,105 @@
+name: Release
+
+# Push a tag such as v0.1.0 to build both downloads and attach them to a draft release.
+# Check the draft, then publish it by hand.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows-x64
+            adapter: Basic Render
+          - os: ubuntu-24.04
+            name: linux-x64
+            adapter: llvmpipe
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      GPUBREEDER_ADAPTER: ${{ matrix.adapter }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check the tag matches the version in Cargo.toml
+        shell: bash
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "Tag $GITHUB_REF_NAME but Cargo.toml says $version"; exit 1; }
+      - name: Install lavapipe, a software Vulkan driver
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
+      - name: Test
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            node --test app/tests/scan.test.cjs
+            cargo test --workspace --release --locked -- --test-threads=1
+          else
+            cargo test -p gpubreeder --release --locked -- --test-threads=1
+          fi
+      - run: cargo install --locked cargo-about --version 0.9.3 --features cli
+      - name: Build
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            cargo build --release --locked --workspace
+            cargo about generate --workspace --fail -o THIRD-PARTY-LICENSES.html about.hbs
+          else
+            cargo build --release --locked -p gpubreeder
+            cargo about generate --fail -o THIRD-PARTY-LICENSES.html about.hbs
+          fi
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          dir="GPUBreeder-$GITHUB_REF_NAME-${{ matrix.name }}"
+          mkdir "$dir"
+          cp LICENSE NOTICE.md README.md THIRD-PARTY-LICENSES.html "$dir/"
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp target/release/gpubreeder-app.exe "$dir/GPUBreeder.exe"
+            cp target/release/gpubreeder.exe "$dir/gpubreeder-cli.exe"
+            7z a "$dir.zip" "$dir" > /dev/null
+            file="$dir.zip"
+          else
+            cp target/release/gpubreeder "$dir/gpubreeder"
+            tar czf "$dir.tar.gz" "$dir"
+            file="$dir.tar.gz"
+          fi
+          sha256sum "$file" > "$file.sha256"
+          echo "file=$file" >> "$GITHUB_OUTPUT"
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ steps.package.outputs.file }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            ${{ steps.package.outputs.file }}
+            ${{ steps.package.outputs.file }}.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Create a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft --generate-notes --title "GPUBreeder $GITHUB_REF_NAME" GPUBreeder-*
