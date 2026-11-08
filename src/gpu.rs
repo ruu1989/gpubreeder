@@ -23,6 +23,8 @@ const WORKGROUP: u32 = 64;
 const WANT_HEADER: usize = SLOTS;
 /// The centre table starts with 65 offsets, one range per set of slots.
 const CENTRE_HEADER: usize = 65;
+/// Most prefixes in one batch, when the device allows a buffer that big. Software drivers such
+/// as lavapipe cap one storage binding at 128 MiB, which holds fewer.
 const MAX_PREFIXES: usize = 1 << 22;
 /// Largest dispatch along one axis.
 const DISPATCH_ROW: u32 = 65_535;
@@ -144,6 +146,8 @@ pub struct GpuBackend {
     /// Set by wgpu when the device dies or reports an error.
     /// Set by wgpu's callbacks when the device is lost or reports an error.
     failed: Arc<Mutex<Option<String>>>,
+    /// Prefixes that fit in the prefix buffer on this device.
+    max_prefixes: usize,
 }
 
 fn storage(device: &wgpu::Device, label: &str, size: u64, usage: wgpu::BufferUsages) -> wgpu::Buffer {
@@ -209,7 +213,9 @@ impl GpuBackend {
         use wgpu::BufferUsages as U;
         let params = storage(&device, "params", std::mem::size_of::<Params>() as u64, U::UNIFORM | U::COPY_DST);
         let pool = storage(&device, "pool", (MAX_POOL * 24) as u64, U::STORAGE | U::COPY_DST);
-        let prefixes = storage(&device, "prefixes", (MAX_PREFIXES * PREFIX_STRIDE * 4) as u64, U::STORAGE | U::COPY_DST);
+        let binding_limit = device.limits().max_storage_buffer_binding_size as usize;
+        let max_prefixes = MAX_PREFIXES.min(binding_limit / (PREFIX_STRIDE * 4));
+        let prefixes = storage(&device, "prefixes", (max_prefixes * PREFIX_STRIDE * 4) as u64, U::STORAGE | U::COPY_DST);
         let claims = storage(&device, "claims", (GENOTYPES * 4) as u64, U::STORAGE | U::COPY_DST | U::COPY_SRC);
         let recipes = storage(&device, "recipes", (GENOTYPES * RECIPE_STRIDE * 4) as u64, U::STORAGE | U::COPY_SRC);
         let want = storage(&device, "want", ((WANT_HEADER + GENOTYPES / 32 + 1) * 4) as u64, U::STORAGE | U::COPY_DST);
@@ -257,6 +263,7 @@ impl GpuBackend {
             control: Arc::default(),
             last_seconds: 0.0,
             failed,
+            max_prefixes,
         })
     }
 
@@ -442,7 +449,7 @@ impl GpuBackend {
                 let tail = (stop - start) as f64;
                 // A shared entry pairs each plant in its range with every plant after it.
                 *cost += if job.shared() { tail * (reach - start + reach - stop + 1) as f64 / 2.0 } else { tail };
-                if *cost * job.group_work() >= self.batch_budget || batch.len() / PREFIX_STRIDE >= MAX_PREFIXES {
+                if *cost * job.group_work() >= self.batch_budget || batch.len() / PREFIX_STRIDE >= self.max_prefixes {
                     self.flush(job, batch, cost)?;
                 }
                 start = stop;
@@ -473,7 +480,7 @@ impl GpuBackend {
         // Speed differs a lot between sizes because small groups try every centre. Never start a
         // size above what the GPU just managed, since it may be busy with something else.
         self.batch_budget = self.batch_budget.min(INITIAL_BATCH_GROUPS);
-        let mut batch: Vec<u32> = Vec::with_capacity(MAX_PREFIXES * PREFIX_STRIDE);
+        let mut batch: Vec<u32> = Vec::with_capacity(self.max_prefixes * PREFIX_STRIDE);
         let mut cost = 0f64;
         let mut ids = [0usize; MAX_NEIGHBOURS];
         self.walk(&job, 0, 0, 0, [0; SLOTS], &mut ids, &mut batch, &mut cost)?;
@@ -636,6 +643,17 @@ mod tests {
         assert!(result.err().is_some_and(|e| e.is::<GpuFailure>()));
         assert!(started.elapsed() < GPU_WAIT_LIMIT * 2);
         std::mem::forget(backend);
+    }
+
+    /// A device with a small storage limit holds fewer prefixes per batch, as lavapipe does. Cutting
+    /// batches at that cap must not lose or change any result.
+    #[test]
+    fn a_small_prefix_buffer_gives_the_same_results() {
+        let mut gpu = GpuBackend::new().expect("GPU required for this test");
+        gpu.max_prefixes = 5_000;
+        for case in selftest::cases().into_iter().take(2) {
+            assert_eq!(selftest::compare(&mut gpu, &case).unwrap(), None, "{}", case.name);
+        }
     }
 
     /// The same cases `gpubreeder --selftest` runs.
