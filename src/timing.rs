@@ -88,6 +88,50 @@ impl Conditions {
     }
 }
 
+/// The growth stages the game names when you look at a plant, up to the point the guide needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum Stage {
+    Seed,
+    Seedling,
+    Sapling,
+    Crossbreed,
+    Mature,
+}
+
+impl Stage {
+    pub fn name(self) -> &'static str {
+        match self {
+            Stage::Seed => "Seed",
+            Stage::Seedling => "Seedling",
+            Stage::Sapling => "Sapling",
+            Stage::Crossbreed => "Crossbreed",
+            Stage::Mature => "Mature",
+        }
+    }
+}
+
+/// Where a plant is after `ticks` growth ticks: its stage, and how far through that stage it is,
+/// from 0 to 1. A stage's progress is its age over its length, and resets to 0 at each new stage.
+pub fn stage_at(crop: &Crop, g_genes: u32, conditions: Conditions, ticks: u32) -> (Stage, f32) {
+    let rate = conditions.quality(crop) * (1.0 + g_genes as f32 * 0.25);
+    let stages = [
+        (Stage::Seed, SEED, rate),
+        (Stage::Seedling, SEEDLING, rate),
+        (Stage::Sapling, SAPLING, rate),
+        (Stage::Crossbreed, crop.crossbreed, 1.0),
+        (Stage::Mature, crop.mature, rate),
+    ];
+    let mut left = ticks;
+    for (stage, minutes, rate) in stages {
+        let length = stage_ticks(minutes, rate);
+        if left < length {
+            return (stage, (left as f32 * TICK_SECONDS as f32 * rate / (minutes * 60.0)).min(1.0));
+        }
+        left -= length;
+    }
+    (Stage::Mature, 1.0)
+}
+
 /// Ticks until a stage ends: progress must strictly exceed the stage length.
 fn stage_ticks(minutes: f32, rate: f32) -> u32 {
     let length = minutes * 60.0;
@@ -189,6 +233,28 @@ mod tests {
         assert!((plain.quality(crop_by_key("blue_berry").unwrap()) - 0.75).abs() < 1e-5);
         assert!((plain.quality(crop_by_key("potato").unwrap()) - 6.0 / 7.0).abs() < 1e-5);
         assert_eq!(Conditions::PERFECT.quality(hemp()), 1.0);
+    }
+
+    #[test]
+    fn stages_follow_the_timeline() {
+        // 0G hemp at full quality: Seed 2 ticks, Seedling 11, Sapling 11, Crossbreed 2.
+        let at = |ticks| stage_at(hemp(), 0, Conditions::PERFECT, ticks);
+        assert_eq!(at(0), (Stage::Seed, 0.0));
+        assert_eq!(at(2), (Stage::Seedling, 0.0));
+        assert_eq!(at(7).0, Stage::Seedling);
+        assert!((at(7).1 - 0.5).abs() < 1e-5);
+        assert_eq!(at(13), (Stage::Sapling, 0.0));
+        assert_eq!(at(24), (Stage::Crossbreed, 0.0));
+        assert_eq!(at(26), (Stage::Mature, 0.0));
+        let t = Timeline::new(hemp(), 0, Conditions::PERFECT).unwrap();
+        assert_eq!(at(t.to_crossbreed()).0, Stage::Crossbreed);
+        assert_eq!(at(t.to_mature()).0, Stage::Mature);
+        // Unfertilised hemp grows at two thirds, so each tick adds about 6.7% of Sapling.
+        let plain = Conditions { fertilized: false, other_quality: 1.0 };
+        let slow = Timeline::new(hemp(), 0, plain).unwrap();
+        let (stage, done) = stage_at(hemp(), 0, plain, slow.to_sapling() + 3);
+        assert_eq!(stage, Stage::Sapling);
+        assert!((done - 0.2).abs() < 1e-4);
     }
 
     #[test]

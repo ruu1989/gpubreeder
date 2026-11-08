@@ -33,7 +33,7 @@
               <button class="ghost" id="scanHere">Scan clones</button>
             </div>
             <p class="hint" id="scanNote" hidden></p>
-            <textarea id="paste" spellcheck="false" placeholder="Paste from Rust Breeder, one plant per line&#10;GGYYWH&#10;XGHGWY"></textarea>
+            <textarea id="paste" spellcheck="false" placeholder="Type your clones, one per line, or press Scan clones&#10;GGYYWH&#10;XGHGWY"></textarea>
             <div class="chips" id="plants"></div>
             <p class="hint" id="lastClone" hidden></p>
             <p class="warn" id="ignored" hidden></p>
@@ -79,7 +79,7 @@
           <div class="plans" id="plans">
             <div class="empty" id="emptyPlans">
               <h3>Plans appear here</h3>
-              <p>Paste your clones, pick the genes you want, and press Find plans.</p>
+              <p>Scan or type your clones, pick the genes you want, and press Find plans.</p>
             </div>
           </div>
         </div>
@@ -100,6 +100,11 @@
             </div>
             <p class="error" id="deadline" hidden></p>
             <div class="actions" id="actions"></div>
+            <div class="stepnav">
+              <button id="prevCue" title="Previous step (Page Up)">← Back</button>
+              <span id="cueCount"></span>
+              <button id="nextCue" title="Next step without confirming (Page Down)">Skip →</button>
+            </div>
           </div>
           <div class="side">
             <article class="panel">

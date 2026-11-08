@@ -73,11 +73,15 @@ pub struct Cue {
     pub step: usize,
     pub headline: String,
     pub detail: String,
+    /// What to look for in game before moving on. Times only estimate when this happens.
+    pub condition: Option<String>,
     pub plants: Vec<String>,
     /// Where to find this plant in storage. Empty for plants the guide has you make.
     pub places: Vec<Place>,
     /// Planter position for this plant, 0 to 8.
     pub slot: Option<u8>,
+    /// The neighbours to plant, in planting order, for a neighbour cue.
+    pub neighbours: Vec<Neighbour>,
     /// Seconds after the centre was planted that this cue waits for.
     pub wait_until: Option<u32>,
     /// Latest safe finish, in seconds after the centre was planted.
@@ -93,14 +97,28 @@ impl Cue {
             step,
             headline,
             detail,
+            condition: None,
             plants: Vec::new(),
             places: Vec::new(),
             slot: None,
+            neighbours: Vec::new(),
             wait_until: None,
             deadline: None,
             timer_seconds: None,
         }
     }
+}
+
+/// One neighbour within a neighbour cue.
+#[derive(Clone, Debug, Serialize)]
+pub struct Neighbour {
+    /// Planting order, from 1.
+    pub number: u32,
+    pub genes: String,
+    /// Where to find it in storage. Empty for plants the guide has you make.
+    pub places: Vec<Place>,
+    /// Planter position, 0 to 8.
+    pub slot: u8,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -111,9 +129,15 @@ pub struct Need {
     pub places: Vec<Place>,
 }
 
-/// When one crossing's neighbours go in, in seconds after the centre.
+/// When one crossing's neighbours go in. The ticks are what the guide goes by, because the centre's
+/// stage shows them in game. The seconds only estimate them.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct Window {
+    /// Start planting once the centre has grown this many ticks...
+    pub first_tick: u32,
+    /// ...and no later than this many.
+    pub last_tick: u32,
+    /// Estimates in seconds after the centre was planted.
     pub earliest: u32,
     pub target: u32,
     pub latest: u32,
@@ -146,24 +170,51 @@ fn seconds(ticks: u32) -> f64 {
 
 /// Neighbours must go in before the centre crossbreeds, but late enough that none of them
 /// crossbreeds first, because a neighbour that has crossbred counts with its changed genes.
+///
+/// The window is counted in the centre's growth ticks, because the player sees those as its stage
+/// and progress. Seeing a tick says nothing about how long ago it landed, so with `left` ticks to
+/// go the centre crossbreeds somewhere between `left - 1` fast ticks and `left` slow ticks away.
 /// Both limits assume every tick lands at the unluckiest end of its jitter.
 pub fn planting_window(centre_ticks: u32, neighbour_ticks: &[u32]) -> Result<Window> {
     let fast = 1.0 - TICK_JITTER;
     let slow = 1.0 + TICK_JITTER;
     let quickest = neighbour_ticks.iter().copied().min().unwrap_or(centre_ticks);
-    let earliest = (slow * seconds(centre_ticks) - fast * seconds(quickest) + WINDOW_MARGIN).max(0.0);
     let planting = PLANT_SECONDS * neighbour_ticks.len() as f64;
-    let latest = fast * seconds(centre_ticks) - WINDOW_MARGIN - planting;
-    if earliest > latest {
+    // The first neighbour must not reach Crossbreed before the centre does.
+    let late_enough = |left: u32| slow * seconds(left) + WINDOW_MARGIN < fast * seconds(quickest);
+    // Every neighbour must be in before the centre does.
+    let early_enough = |left: u32| left >= 1 && fast * seconds(left - 1) >= planting + WINDOW_MARGIN;
+    let safe: Vec<u32> =
+        (0..centre_ticks).filter(|&grown| late_enough(centre_ticks - grown) && early_enough(centre_ticks - grown)).collect();
+    let (Some(&first_tick), Some(&last_tick)) = (safe.first(), safe.last()) else {
         bail!("no safe planting window: the neighbours grow too fast for this centre");
+    };
+    // The estimate keeps to times that are safe by the clock alone, when there are any, and to
+    // times when the centre is usually inside the tick window.
+    let clock_earliest = slow * seconds(centre_ticks) - fast * seconds(quickest) + WINDOW_MARGIN;
+    let clock_latest = fast * seconds(centre_ticks) - WINDOW_MARGIN - planting;
+    let (mut earliest, mut latest) = (seconds(first_tick), seconds(last_tick + 1) - 1.0);
+    if clock_earliest.max(earliest) <= clock_latest.min(latest) {
+        (earliest, latest) = (clock_earliest.max(earliest), clock_latest.min(latest));
     }
-    let target = ((earliest + latest) / 2.0 / 5.0).round() * 5.0;
     Ok(Window {
-        earliest: earliest.ceil() as u32,
-        target: target as u32,
-        latest: latest.floor() as u32,
+        first_tick,
+        last_tick,
+        earliest: earliest as u32,
+        target: (((earliest + latest) / 2.0 / 5.0).round() * 5.0) as u32,
+        latest: latest as u32,
         crossbreed: (slow * seconds(centre_ticks)).ceil() as u32,
     })
+}
+
+/// A stage and progress as the game shows it, such as "Sapling 40%". `up` rounds the percentage
+/// up instead of down, so a limit holds whichever way the game rounds.
+fn stage_text(crop: &Crop, g_genes: u32, conditions: Conditions, ticks: u32, up: bool) -> String {
+    let (stage, done) = stage_at(crop, g_genes, conditions, ticks);
+    let percent = done * 100.0;
+    // The small nudge keeps float error such as 20.000002 from rounding to the wrong whole number.
+    let percent = if up { (percent - 1e-3).ceil() } else { (percent + 1e-3).floor() };
+    format!("{} {percent:.0}%", stage.name())
 }
 
 fn count(g: Genotype, gene: u8) -> u32 {
@@ -234,7 +285,8 @@ pub fn build(plan: &Plan, inputs: &[Genotype], places: &Places, crop: &Crop, con
         0,
         "Gather your clones".into(),
         format!(
-            "You need {}. Bring {}, and use an empty planter. Timings assume {} with {:.0}% health.",
+            "You need {}. Bring {}, and use an empty planter. Each step says what to look for on the plant before you go on. \
+             Its percentages and the timer assume {} with {:.0}% health, so check the planter shows that. The timer is only an estimate.",
             gather.join(", "),
             if conditions.fertilized { "water and fertiliser" } else { "water" },
             if conditions.fertilized { "a fertilised planter" } else { "a planter without fertiliser" },
@@ -252,39 +304,66 @@ pub fn build(plan: &Plan, inputs: &[Genotype], places: &Places, crop: &Crop, con
         windows.push(window);
         let order_note = if order_matters(step) { "Planting order matters here." } else { "Any order works here." };
 
-        let detail = "Remove every plant of this crop from the planter, and water it to about 60%, not full. Then plant this in the middle. The timer starts when you confirm.";
+        let detail = "Remove every plant of this crop from the planter, and water it to about 60%, not full. Then plant this in the middle. The estimate starts when you confirm.";
         let mut plant = Cue::new(CueKind::PlantCentre, number, "Plant the centre".into(), detail.into());
         plant.plants = vec![centre.to_string()];
         plant.places = stored(centre);
         plant.slot = Some(CENTRE_SLOT);
         cues.push(plant);
 
+        let centre_g = count(*centre, G);
+        let from = stage_text(crop, centre_g, conditions, window.first_tick, false);
+        let to = stage_text(crop, centre_g, conditions, window.last_tick, true);
         let mut wait = Cue::new(
             CueKind::Wait,
             number,
             "Wait to plant the neighbours".into(),
-            format!("They go in {} after the centre. {order_note}", clock(window.target as f64)),
+            format!(
+                "Look at the centre plant. Too early and a neighbour crossbreeds first, too late and they miss it. \
+                 That's roughly {} to {} after the centre went in. {order_note}",
+                clock(window.earliest as f64),
+                clock(window.latest as f64)
+            ),
         );
+        wait.condition = Some(if window.first_tick == 0 {
+            format!("Plant them straight away, before the centre passes {to}")
+        } else {
+            format!("Plant them once the centre shows {from}, and no later than {to}")
+        });
         wait.wait_until = Some(window.target);
         cues.push(wait);
 
-        for (i, neighbour) in step.order.iter().enumerate() {
-            let mut cue =
-                Cue::new(CueKind::PlantNeighbour, number, format!("Plant neighbour {} of {}", i + 1, step.order.len()), order_note.into());
-            cue.plants = vec![neighbour.to_string()];
-            cue.places = stored(neighbour);
-            cue.slot = Some(NEIGHBOUR_SLOTS[i]);
-            cue.deadline = Some(window.latest + PLANT_SECONDS as u32 * (i as u32 + 1));
-            cues.push(cue);
-        }
+        // All of a crossing's neighbours share one cue, since they go in together with the same
+        // deadline. The numbers give the planting order and match the planter picture.
+        let count = step.order.len();
+        let (headline, how) = match count {
+            1 => ("Plant the neighbour".to_string(), "Put it in planter spot 1.".to_string()),
+            n if order_matters(step) => (
+                format!("Plant the {n} neighbours"),
+                format!("Plant them in this order, 1 first, each in its numbered planter spot. {order_note}"),
+            ),
+            n => (format!("Plant the {n} neighbours"), format!("Put each in its numbered planter spot. {order_note}")),
+        };
+        let mut cue = Cue::new(CueKind::PlantNeighbour, number, headline, how);
+        cue.condition = Some("Every neighbour must be in before the centre reaches Crossbreed".into());
+        cue.plants = step.order.iter().map(Genotype::to_string).collect();
+        cue.neighbours = step
+            .order
+            .iter()
+            .enumerate()
+            .map(|(i, g)| Neighbour { number: i as u32 + 1, genes: g.to_string(), places: stored(g), slot: NEIGHBOUR_SLOTS[i] })
+            .collect();
+        cue.deadline = Some(window.latest + PLANT_SECONDS as u32 * count as u32);
+        cues.push(cue);
 
         let ready = (seconds(centre_time.to_mature()) * (1.0 + TICK_JITTER)).ceil();
         let mut wait = Cue::new(
             CueKind::Wait,
             number,
             "Wait for the crossbreed".into(),
-            "Keep the planter watered, lit and warm. Avoid server restarts, and leave the plants alone.".into(),
+            "Its genes change as it enters Crossbreed, and clones can be taken again once it's Mature. Keep the planter watered, lit and warm. Avoid server restarts, and leave the plants alone.".into(),
         );
+        wait.condition = Some("The centre shows Mature".into());
         wait.wait_until = Some(ready as u32);
         cues.push(wait);
 
@@ -322,6 +401,7 @@ pub fn build(plan: &Plan, inputs: &[Genotype], places: &Places, crop: &Crop, con
                     "You need {later} in total. Plant all {held}, confirm, and take clones from each once they reach Sapling, before they crossbreed."
                 );
                 let mut cue = Cue::new(CueKind::Multiply, number, format!("Multiply to {gain} clones"), detail);
+                cue.condition = Some("Every plant shows Sapling. Take the clones before any reaches Crossbreed".into());
                 cue.plants = vec![step.result.to_string()];
                 cue.timer_seconds = Some(round_seconds);
                 cues.push(cue);
@@ -409,15 +489,23 @@ mod tests {
         let plan = Plan { goal, generation: 2, steps, inputs_used: vec![a, b] };
         let places = places_of(&[Some(a), None, Some(b)]);
         let guide = build(&plan, &[a, b], &places, crop_by_key("hemp").unwrap(), Conditions::PERFECT).unwrap();
-        let planted: Vec<&Cue> = guide.cues.iter().filter(|c| matches!(c.kind, CueKind::PlantCentre | CueKind::PlantNeighbour)).collect();
+        // Every planted plant with where the guide says to find it, centres and neighbours alike.
+        let mut planted: Vec<(String, Vec<Place>)> = Vec::new();
+        for cue in &guide.cues {
+            match cue.kind {
+                CueKind::PlantCentre => planted.push((cue.plants[0].clone(), cue.places.clone())),
+                CueKind::PlantNeighbour => planted.extend(cue.neighbours.iter().map(|n| (n.genes.clone(), n.places.clone()))),
+                _ => {}
+            }
+        }
         assert_eq!(planted.len(), 4);
-        for cue in planted {
-            let want: Vec<u32> = match cue.plants[0].as_str() {
+        for (genes, places) in planted {
+            let want: Vec<u32> = match genes.as_str() {
                 p if p == a.to_string() => vec![1],
                 p if p == b.to_string() => vec![3],
                 _ => vec![],
             };
-            assert_eq!(cue.places.iter().map(|p| p.number).collect::<Vec<_>>(), want);
+            assert_eq!(places.iter().map(|p| p.number).collect::<Vec<_>>(), want);
         }
         let need = |g: Genotype| guide.needs.iter().find(|n| n.genes == g.to_string()).unwrap();
         assert_eq!(need(b).places[0].number, 3);
@@ -427,8 +515,12 @@ mod tests {
     #[test]
     fn a_window_keeps_slow_centres_ahead_of_fast_neighbours() {
         // A 0G centre takes 24 ticks, a 6G neighbour 11.
+        // With 8 ticks to go the centre needs at most 528 s, plus 30 s of margin, against the
+        // neighbour's quickest 594 s. With 9 to go it could need 594 s, which is too close.
         let w = planting_window(24, &[11]).unwrap();
-        assert!(w.earliest as f64 >= 1.1 * 24.0 * 60.0 - 0.9 * 11.0 * 60.0);
+        assert_eq!(w.first_tick, 16);
+        // The single neighbour needs 15 s and 30 s of margin, so 2 ticks must still be to come.
+        assert_eq!(w.last_tick, 22);
         assert!(w.earliest < w.latest);
         assert!(w.target >= w.earliest && w.target <= w.latest);
         assert!(((w.latest as f64) + 15.0) < 0.9 * 24.0 * 60.0);
@@ -442,6 +534,45 @@ mod tests {
                 planting_window(centre, &[neighbour; 8]).unwrap();
             }
         }
+    }
+
+    /// Checks the window's own promise for every pairing: planting at any tick inside it, at the
+    /// unluckiest jitter, gets every neighbour in before the centre crossbreeds and none crossbreeds first.
+    #[test]
+    fn every_tick_in_a_window_is_safe() {
+        let ticks = [24, 19, 15, 13, 13, 11, 11, 36, 28];
+        for &centre in &ticks {
+            for &neighbour in &ticks {
+                for count in 1..=8 {
+                    let w = planting_window(centre, &vec![neighbour; count]).unwrap();
+                    assert!(w.first_tick <= w.last_tick && w.last_tick < centre);
+                    for grown in w.first_tick..=w.last_tick {
+                        let left = (centre - grown) as f64;
+                        let centre_soonest = 0.9 * 60.0 * (left - 1.0);
+                        let centre_latest = 1.1 * 60.0 * left;
+                        assert!(centre_soonest >= 15.0 * count as f64, "{centre} {neighbour} {count} {grown}");
+                        assert!(0.9 * 60.0 * neighbour as f64 > centre_latest, "{centre} {neighbour} {count} {grown}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn waits_name_what_to_look_for() {
+        let (a, b, made, goal) = (genotype("GGGHHH"), genotype("GGGYHH"), genotype("GGHHHH"), genotype("GGGGHH"));
+        let steps =
+            vec![Recipe { result: made, order: vec![a], centre: Some(b) }, Recipe { result: goal, order: vec![made], centre: Some(b) }];
+        let plan = Plan { goal, generation: 2, steps, inputs_used: vec![a, b] };
+        let plain = Conditions { fertilized: false, other_quality: 1.0 };
+        let guide = build(&plan, &[a, b], &Places::new(), crop_by_key("hemp").unwrap(), plain).unwrap();
+        for cue in guide.cues.iter().filter(|c| matches!(c.kind, CueKind::Wait | CueKind::Multiply | CueKind::PlantNeighbour)) {
+            assert!(cue.condition.is_some(), "{} has no condition", cue.headline);
+            println!("{}: {}", cue.headline, cue.condition.as_ref().unwrap());
+        }
+        let first = guide.cues.iter().find(|c| c.kind == CueKind::Wait).unwrap();
+        let text = first.condition.as_ref().unwrap();
+        assert!(text.contains('%') && (text.contains("Seedling") || text.contains("Sapling")), "{text}");
     }
 
     #[test]
@@ -504,11 +635,16 @@ mod tests {
         assert_eq!(guide.windows.len(), plan.steps.len());
         for (index, step) in plan.steps.iter().enumerate() {
             let cues: Vec<&Cue> = guide.cues.iter().filter(|c| c.step == index + 1 && c.kind == CueKind::PlantNeighbour).collect();
-            let planted: Vec<String> = cues.iter().map(|c| c.plants[0].clone()).collect();
+            assert_eq!(cues.len(), 1, "a crossing's neighbours share one cue");
+            let neighbours = &cues[0].neighbours;
+            let planted: Vec<String> = neighbours.iter().map(|n| n.genes.clone()).collect();
             let wanted: Vec<String> = step.order.iter().map(Genotype::to_string).collect();
             assert_eq!(planted, wanted, "neighbours must keep the verified order");
-            let centre = guide.cues.iter().find(|c| c.step == index + 1 && c.kind == CueKind::PlantCentre).unwrap();
-            assert!(cues.iter().all(|c| c.slot != centre.slot));
+            assert_eq!(neighbours.iter().map(|n| n.number).collect::<Vec<_>>(), (1..=neighbours.len() as u32).collect::<Vec<_>>());
+            let mut slots: Vec<u8> = neighbours.iter().map(|n| n.slot).chain([CENTRE_SLOT]).collect();
+            slots.sort();
+            slots.dedup();
+            assert_eq!(slots.len(), neighbours.len() + 1, "every plant needs its own planter spot");
         }
         assert!(guide.parallel_seconds <= guide.total_seconds);
     }

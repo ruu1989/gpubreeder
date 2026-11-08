@@ -18,7 +18,7 @@ const state = {
 
 function genes(text, big) {
   const el = document.createElement('span');
-  el.className = 'genes' + (big ? ' big' : '');
+  el.className = 'genes' + (big === 'mid' ? ' mid' : big ? ' big' : '');
   el.setAttribute('aria-label', text);
   for (const letter of text) {
     const i = document.createElement('i');
@@ -383,7 +383,7 @@ function renderPlans() {
 function emptyPlans() {
   const empty = document.createElement('div');
   empty.className = 'empty';
-  empty.innerHTML = '<h3>Plans appear here</h3><p>Paste your clones, pick the genes you want, and press Find plans.</p>';
+  empty.innerHTML = '<h3>Plans appear here</h3><p>Scan or type your clones, pick the genes you want, and press Find plans.</p>';
   return empty;
 }
 
@@ -444,7 +444,7 @@ function planCard(plan) {
 /* ---------- guide ---------- */
 
 function beginRun(plan) {
-  state.run = { index: plan.index, goal: plan.goal, guide: plan.guide.Ok, cue: 0, anchor: null, timerEnd: null, timerLength: null };
+  state.run = { index: plan.index, goal: plan.goal, guide: plan.guide.Ok, cue: 0, anchor: null, anchorStep: null, timerEnd: null, timerLength: null };
   applyHotkey();
   switchView('guide');
   enterCue();
@@ -454,25 +454,44 @@ function cue() {
   return state.run.guide.cues[state.run.cue];
 }
 
+// Estimates count from when this crossing's centre was confirmed. Without that there is none,
+// and the cue's condition is all there is to go by.
+function estimateEnd(c) {
+  const run = state.run;
+  if (c.kind !== 'wait' || !run.anchor || run.anchorStep !== c.step) return null;
+  return run.anchor + c.wait_until * 1000;
+}
+
+function armAlarm() {
+  const left = (state.run.timerEnd - Date.now()) / 1000;
+  if (state.run.timerEnd && left > 0) invoke('arm_alarm', { seconds: left });
+  else invoke('disarm_alarm');
+}
+
 function enterCue() {
   const run = state.run;
   const c = cue();
-  run.timerEnd = null;
-  if (c.kind === 'wait' && run.anchor) {
-    run.timerEnd = run.anchor + c.wait_until * 1000;
-    run.timerLength = c.wait_until * 1000;
-    invoke('arm_alarm', { seconds: Math.max(0, (run.timerEnd - Date.now()) / 1000) });
-  }
+  run.timerEnd = estimateEnd(c);
+  if (run.timerEnd) run.timerLength = c.wait_until * 1000;
+  armAlarm();
   announce(c);
   save();
   renderGuide();
+}
+
+// Moves to any cue without confirming the current one, so a missed or mistaken cue can be fixed.
+function goTo(index) {
+  const run = state.run;
+  if (!run || index < 0 || index >= run.guide.cues.length || index === run.cue) return;
+  run.cue = index;
+  run.multiplyDone = false;
+  enterCue();
 }
 
 function advance() {
   const run = state.run;
   if (!run) return;
   const c = cue();
-  if (c.kind === 'wait' && run.timerEnd > Date.now()) return;
   if (c.kind === 'multiply' && !run.multiplyDone) {
     run.multiplyDone = true;
     run.timerEnd = Date.now() + c.timer_seconds * 1000;
@@ -483,9 +502,11 @@ function advance() {
     renderGuide();
     return;
   }
-  if (c.kind === 'multiply' && run.timerEnd > Date.now()) return;
   run.multiplyDone = false;
-  if (c.kind === 'plant_centre') run.anchor = Date.now();
+  if (c.kind === 'plant_centre') {
+    run.anchor = Date.now();
+    run.anchorStep = c.step;
+  }
   if (c.kind === 'finish') {
     endRun();
     return;
@@ -535,7 +556,7 @@ function spoken(c) {
   const where = p ? ` Box ${p.box}, row ${p.row}, column ${p.column}.` : '';
   switch (c.kind) {
     case 'plant_centre': return `Plant the centre. ${letters}.${where}`;
-    case 'plant_neighbour': return `${c.headline}. ${letters}.${where}`;
+    case 'plant_neighbour': return c.plants.length === 1 ? `${c.headline}. ${letters}.${where}` : `${c.headline}.`;
     case 'check': return 'Crossbreed done. Check the centre plant.';
     case 'clone': return 'Take the clones.';
     case 'multiply': return c.headline;
@@ -577,11 +598,28 @@ function placesBox(places) {
     more.textContent = `and ${places.length - 3} more`;
     box.append(more);
   }
+  box.append(checkLine());
+  return box;
+}
+
+function checkLine(several) {
   const check = document.createElement('div');
   check.className = 'also';
-  check.textContent = 'Check the genes match before you plant it.';
-  box.append(check);
-  return box;
+  check.textContent = several ? 'Check the genes match before you plant each one.' : 'Check the genes match before you plant it.';
+  return check;
+}
+
+// One neighbour in a neighbour cue: its planting number, which matches the planter picture,
+// its genes, and where it's stored.
+function neighbourRow(n, _, all) {
+  const row = document.createElement('div');
+  row.className = 'nrow';
+  const number = document.createElement('b');
+  number.textContent = n.number;
+  const where = document.createElement('span');
+  where.textContent = n.places.length ? placeShort(n.places) : 'made earlier in this guide';
+  row.append(number, genes(n.genes, all.length < 3 ? 'big' : 'mid'), where);
+  return row;
 }
 
 function cueEyebrow(c, steps) {
@@ -601,11 +639,31 @@ function cueCard(c, index, run) {
   const big = document.createElement('div');
   big.className = 'bigplants';
   const needs = c.kind === 'prepare' ? run.guide.needs.filter(n => n.starting_plant) : null;
-  big.replaceChildren(...(needs ? needs.map(needRow) : c.plants.map(p => genes(p, c.plants.length < 3))));
+  if (needs) big.replaceChildren(...needs.map(needRow));
+  else if ((c.neighbours || []).length) big.replaceChildren(...c.neighbours.map(neighbourRow), checkLine(c.neighbours.length > 1));
+  else big.replaceChildren(...c.plants.map(p => genes(p, c.plants.length < 3)));
   const detail = document.createElement('p');
   detail.className = 'detail';
   detail.textContent = c.detail;
-  card.append(eyebrow, head, big, placesBox(c.places || []), detail);
+  card.append(eyebrow, head, big, placesBox(c.places || []));
+  if (c.condition) {
+    const look = document.createElement('div');
+    look.className = 'condition';
+    const label = document.createElement('b');
+    label.textContent = c.kind === 'plant_neighbour' ? 'Deadline' : 'Look for';
+    const text = document.createElement('span');
+    text.textContent = c.condition;
+    look.append(label, text);
+    card.append(look);
+  }
+  card.append(detail);
+  // Clicking another card jumps to it. Clicks on the live controls bubble up here too, and by then
+  // the cue they confirmed has already moved on, so they're left out. The button may already be
+  // gone from the page, so this checks the path the click took rather than where it is now.
+  card.onclick = event => {
+    if (!state.run || event.composedPath().includes($('live'))) return;
+    if (Number(card.dataset.index) !== state.run.cue) goTo(Number(card.dataset.index));
+  };
   return card;
 }
 
@@ -673,7 +731,12 @@ function renderGuide() {
   };
   switch (c.kind) {
     case 'prepare': add("I've got everything", advance, true, true); break;
-    case 'plant_centre': add('Centre planted, start timer', advance, true, true); break;
+    case 'plant_centre': add('Centre planted', advance, true, true); break;
+    case 'wait': {
+      const next = run.guide.cues[run.cue + 1];
+      add(next && next.kind === 'plant_neighbour' ? 'The centre is there' : 'The centre is Mature', advance, true, true);
+      break;
+    }
     case 'plant_neighbour': add('Planted', advance, true, true); break;
     case 'check':
       add('Genes match', advance, true, true);
@@ -683,12 +746,13 @@ function renderGuide() {
       break;
     case 'clone': add('Clones taken', advance, true, true); break;
     case 'multiply':
-      add(run.multiplyDone ? 'Clones taken' : 'Planted, start timer', advance, true, true);
-      actions.firstChild.disabled = run.multiplyDone && run.timerEnd > Date.now();
+      add(run.multiplyDone ? 'Clones taken' : 'All planted', advance, true, true);
       break;
     case 'finish': add('End guide', advance, true, true); break;
-    default: add('Waiting…', advance, false); actions.firstChild.disabled = true;
   }
+  $('prevCue').disabled = run.cue === 0;
+  $('nextCue').disabled = run.cue === run.guide.cues.length - 1;
+  $('cueCount').textContent = `Step ${run.cue + 1} of ${run.guide.cues.length}`;
   renderPlanter(c);
   const list = $('stepList');
   list.replaceChildren();
@@ -709,22 +773,29 @@ function renderGuide() {
 
 function renderPlanter(c) {
   const run = state.run;
-  const placed = new Map();
+  // Planter spots a cue fills. Guides saved before neighbours shared a cue have one per cue.
+  const spots = x => {
+    if (x.kind === 'plant_centre') return [x.slot];
+    if (x.kind !== 'plant_neighbour') return [];
+    return (x.neighbours || []).length ? x.neighbours.map(n => n.slot) : [x.slot];
+  };
+  const placed = new Set();
   for (let i = 0; i < run.cue; i++) {
     const past = run.guide.cues[i];
-    if (past.step === c.step && past.slot !== null && (past.kind === 'plant_centre' || past.kind === 'plant_neighbour')) placed.set(past.slot, past);
+    if (past.step === c.step) spots(past).forEach(slot => placed.add(slot));
   }
   const box = $('planter');
   box.replaceChildren();
   let order = 0;
   const numbers = new Map();
-  for (const x of run.guide.cues) if (x.step === c.step && x.kind === 'plant_neighbour') numbers.set(x.slot, ++order);
+  for (const x of run.guide.cues) if (x.step === c.step && x.kind === 'plant_neighbour') spots(x).forEach(slot => numbers.set(slot, ++order));
+  const next = new Set(spots(c));
   for (let slot = 0; slot < 9; slot++) {
     const cell = document.createElement('div');
     if (slot === 4) { cell.textContent = 'centre'; cell.classList.add('centre'); }
     else if (numbers.has(slot)) cell.textContent = numbers.get(slot);
     if (placed.has(slot)) cell.classList.add('filled');
-    if (c.slot === slot && (c.kind === 'plant_centre' || c.kind === 'plant_neighbour')) cell.classList.add('next');
+    if (next.has(slot)) cell.classList.add('next');
     box.append(cell);
   }
 }
@@ -740,19 +811,22 @@ function tick() {
     const left = (run.timerEnd - now) / 1000;
     $('clock').textContent = clock(left);
     $('timerBar').style.width = `${Math.min(100, 100 - (left * 100000) / run.timerLength)}%`;
-    $('timerLabel').textContent = left > 0 ? 'until the next cue' : 'time is up';
+    $('timerLabel').textContent = left > 0
+      ? 'Estimate only. Go by what the plant shows, not this timer.'
+      : 'The estimate has passed. Check the plant, and go on only once it matches.';
   }
   const late = $('deadline');
-  const overdue = c.deadline && run.anchor && now > run.anchor + c.deadline * 1000;
+  const overdue = c.deadline && run.anchor && run.anchorStep === c.step && now > run.anchor + c.deadline * 1000;
   late.hidden = !overdue;
-  if (overdue) late.textContent = 'This is past the safe window, so the plant may miss the crossbreed. Check the centre has not crossbred before you continue.';
+  if (overdue) late.textContent = 'By the estimate, the centre could be close to Crossbreed. Check it hasn\'t reached Crossbreed before you plant more.';
 }
 
+// The estimate only prompts a look at the plant. Moving on is always the player's call.
 function alarmFired() {
   if (!state.run) return;
   const c = cue();
-  if (c.kind === 'wait') { state.run.timerEnd = Date.now(); advance(); }
-  else if (c.kind === 'multiply') { chime(); speak('Take the clones now.'); renderGuide(); }
+  if (c.kind === 'wait') { chime(); speak('Check the centre plant.'); renderGuide(); }
+  else if (c.kind === 'multiply') { chime(); speak('Check whether the plants have reached Sapling.'); renderGuide(); }
 }
 
 function applyHotkey() {
@@ -875,10 +949,10 @@ function refreshRun() {
   if (!guide || guide.cues.length !== run.guide.cues.length) return;
   run.guide = guide;
   const c = cue();
-  if (c.kind === 'wait' && run.anchor && run.timerEnd) {
-    run.timerEnd = run.anchor + c.wait_until * 1000;
-    run.timerLength = c.wait_until * 1000;
-    invoke('arm_alarm', { seconds: Math.max(0, (run.timerEnd - Date.now()) / 1000) });
+  if (c.kind === 'wait') {
+    run.timerEnd = estimateEnd(c);
+    if (run.timerEnd) run.timerLength = c.wait_until * 1000;
+    armAlarm();
   }
   save();
   renderGuide();
@@ -1009,12 +1083,20 @@ async function main() {
     renderPlans();
   });
 
+  $('prevCue').onclick = () => state.run && goTo(state.run.cue - 1);
+  $('nextCue').onclick = () => state.run && goTo(state.run.cue + 1);
+  document.addEventListener('keydown', event => {
+    if (!state.run || $('view-guide').hidden || event.target.closest?.('input, textarea, select')) return;
+    if (event.key === 'PageUp') { event.preventDefault(); goTo(state.run.cue - 1); }
+    if (event.key === 'PageDown') { event.preventDefault(); goTo(state.run.cue + 1); }
+  });
+
   if (state.run) {
+    // Guides saved before estimates were tied to a crossing belong to the current one.
+    if (state.run.anchor && state.run.anchorStep === undefined) state.run.anchorStep = cue().step;
     applyHotkey();
     switchView('guide');
-    const c = cue();
-    if (c.kind === 'wait' && state.run.timerEnd) invoke('arm_alarm', { seconds: Math.max(0, (state.run.timerEnd - Date.now()) / 1000) });
-    if (c.kind === 'multiply' && state.run.timerEnd) invoke('arm_alarm', { seconds: Math.max(0, (state.run.timerEnd - Date.now()) / 1000) });
+    armAlarm();
   }
   setInterval(tick, 250);
 }

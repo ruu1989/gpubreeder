@@ -1,6 +1,6 @@
 # GPUBreeder
 
-**Plan Rust crossbreeds on your graphics card, then follow a timed guide while you plant.**
+**Plan Rust crossbreeds on your graphics card, then follow a step-by-step guide while you plant.**
 
 GPUBreeder scans your clones from the screen, searches every route to the genes you want, and
 proves the shortest one. Then it talks you through the planting, step by step, with the box, row
@@ -41,8 +41,11 @@ at any resolution. No Rust Breeder code is copied here. See [NOTICE.md](NOTICE.m
   say when order matters and give the exact order. See [docs/RULES.md](docs/RULES.md).
 - **Guides you through it.** Every cue is laid out in one list. The current one is in focus, and
   the next few stay readable, so you can get their clones ready. Each says what to plant and where
-  to find it, such as "#50, box 2, row 1, col 2". Timers use real grow times for your planter's
-  health and fertiliser, with a voice, a chime and an F9 hotkey so you can stay in the game.
+  to find it, such as "#50, box 2, row 1, col 2". Each wait names what to look for on the plant,
+  such as "the centre shows Seedling 35%, and no later than Sapling 82%". A timer estimates when
+  that happens from real grow times for your planter, but only as a prompt to go and look. You
+  move on when the plant matches, and can step back or skip at any time. A voice, a chime and an
+  F9 hotkey let you stay in the game.
 
 ![The guide, with the current cue in focus and the next one dimmed below it](docs/images/guide.png)
 
