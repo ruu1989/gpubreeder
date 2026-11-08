@@ -3,7 +3,7 @@ members = ["app"]
 
 [package]
 name = "gpubreeder"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Finds crossbreeding plans for plants in Rust (the game) on your GPU, using the game's exact rules."

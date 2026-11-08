@@ -1660,7 +1660,7 @@ dependencies = [
 
 [[package]]
 name = "gpubreeder"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -1673,7 +1673,7 @@ dependencies = [
 
 [[package]]
 name = "gpubreeder-app"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "anyhow",
  "gpubreeder",
