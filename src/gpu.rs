@@ -6,8 +6,8 @@ use crate::rules::*;
 use crate::search::SearchControl;
 use crate::search::{Backend, Candidate, CpuBackend, LayerRequest, LayerResult};
 use anyhow::{Result, anyhow};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const WANT_FREE: u32 = 0;
@@ -48,12 +48,23 @@ const POLL_INTERVAL: Duration = Duration::from_micros(200);
 /// The GPU stopped working mid-search, usually because the driver reset. This device is finished,
 /// so whoever holds it must start a new one.
 #[derive(Debug)]
-pub struct GpuFailure;
+pub struct GpuFailure {
+    /// What went wrong, for bug reports. A driver reset usually shows as a lost device.
+    pub cause: String,
+}
+
+impl GpuFailure {
+    pub fn new(cause: impl Into<String>) -> Self {
+        GpuFailure { cause: cause.into() }
+    }
+}
 
 impl std::fmt::Display for GpuFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(
-            "The GPU stopped responding during the search, usually because the graphics driver reset. Press Find plans to try again.",
+        write!(
+            f,
+            "The GPU stopped responding during the search, usually because the graphics driver reset. Press Find plans to try again. (Details: {})",
+            self.cause
         )
     }
 }
@@ -131,7 +142,8 @@ pub struct GpuBackend {
     control: Arc<SearchControl>,
     pub last_seconds: f64,
     /// Set by wgpu when the device dies or reports an error.
-    failed: Arc<AtomicBool>,
+    /// Set by wgpu's callbacks when the device is lost or reports an error.
+    failed: Arc<Mutex<Option<String>>>,
 }
 
 fn storage(device: &wgpu::Device, label: &str, size: u64, usage: wgpu::BufferUsages) -> wgpu::Buffer {
@@ -163,12 +175,16 @@ impl GpuBackend {
             required_limits: adapter.limits(),
             ..Default::default()
         }))?;
-        let failed = Arc::new(AtomicBool::new(false));
+        let failed: Arc<Mutex<Option<String>>> = Arc::default();
         let lost = failed.clone();
-        device.set_device_lost_callback(move |_, _| lost.store(true, Ordering::SeqCst));
+        device.set_device_lost_callback(move |reason, message| {
+            lost.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(format!("device lost ({reason:?}): {message}"));
+        });
         // Without this handler wgpu panics on the search thread.
         let errored = failed.clone();
-        device.on_uncaptured_error(Arc::new(move |_| errored.store(true, Ordering::SeqCst)));
+        device.on_uncaptured_error(Arc::new(move |error| {
+            errored.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(format!("wgpu error: {error}"));
+        }));
 
         let shader = unsafe {
             // Indexes are all derived from buffer sizes set here, and bounds checks cost real
@@ -253,15 +269,15 @@ impl GpuBackend {
     fn settle(&self, mut done: impl FnMut(wgpu::PollStatus) -> bool) -> Result<()> {
         let started = Instant::now();
         loop {
-            let status = self.device.poll(wgpu::PollType::Poll).map_err(|_| GpuFailure)?;
-            if self.failed.load(Ordering::SeqCst) {
-                return Err(GpuFailure.into());
+            let status = self.device.poll(wgpu::PollType::Poll).map_err(|e| GpuFailure::new(format!("poll failed: {e}")))?;
+            if let Some(cause) = self.failed.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+                return Err(GpuFailure::new(cause).into());
             }
             if done(status) {
                 return Ok(());
             }
             if started.elapsed() > GPU_WAIT_LIMIT {
-                return Err(GpuFailure.into());
+                return Err(GpuFailure::new(format!("no answer within {} s", GPU_WAIT_LIMIT.as_secs())).into());
             }
             std::thread::sleep(POLL_INTERVAL);
         }
@@ -305,8 +321,8 @@ impl GpuBackend {
             mapped = receiver.try_recv().ok();
             mapped.is_some()
         })?;
-        mapped.ok_or(GpuFailure)?.map_err(|_| GpuFailure)?;
-        let data = slice.get_mapped_range().map_err(|_| GpuFailure)?;
+        mapped.ok_or_else(|| GpuFailure::new("readback never mapped"))?.map_err(|e| GpuFailure::new(format!("readback failed: {e}")))?;
+        let data = slice.get_mapped_range().map_err(|e| GpuFailure::new(format!("readback unreadable: {e}")))?;
         let words: &[u32] = bytemuck::cast_slice(&data);
         let claims = words[..GENOTYPES].to_vec();
         let recipes = words[GENOTYPES..].to_vec();
@@ -553,8 +569,15 @@ impl Backend for GpuBackend {
         let (claims, recipes) = self.read_results()?;
         // A reset can wipe GPU memory without an error, and an empty result would read as proof
         // that nothing was reachable. Plants nobody asked for must still be marked as such.
-        if (0..GENOTYPES).any(|i| claims[i] > CLAIMED || (!still_wanted[i] && claims[i] != UNWANTED)) {
-            return Err(GpuFailure.into());
+        let odd = (0..GENOTYPES).filter(|&i| claims[i] > CLAIMED || (!still_wanted[i] && claims[i] != UNWANTED)).collect::<Vec<_>>();
+        if let Some(&first) = odd.first() {
+            return Err(GpuFailure::new(format!(
+                "results look wiped: {} genotypes have impossible claims, the first is {} with {:#x}",
+                odd.len(),
+                Genotype(first as u16),
+                claims[first]
+            ))
+            .into());
         }
         for index in 0..GENOTYPES {
             if claims[index] != CLAIMED {

@@ -277,7 +277,8 @@ fn benchmark(app: AppHandle) -> Result<(), String> {
         return Err("Wait for the search to finish first.".into());
     }
     std::thread::spawn(move || {
-        let reply = catch_unwind(AssertUnwindSafe(|| run_benchmark(&shared))).unwrap_or_else(|_| Err(GpuFailure.into()));
+        let reply = catch_unwind(AssertUnwindSafe(|| run_benchmark(&shared)))
+            .unwrap_or_else(|_| Err(GpuFailure::new("the GPU code panicked").into()));
         if reply.as_ref().err().is_some_and(|error| error.is::<GpuFailure>()) {
             shared.discard_backend();
         }
@@ -299,7 +300,8 @@ fn start_search(app: AppHandle, request: SearchRequest) -> Result<(), String> {
     std::thread::spawn(move || {
         // wgpu panics on some device errors, and a thread that dies silently would leave the page
         // saying "searching" forever.
-        let reply = catch_unwind(AssertUnwindSafe(|| run_search(&app, &shared, request))).unwrap_or_else(|_| Err(GpuFailure.into()));
+        let reply = catch_unwind(AssertUnwindSafe(|| run_search(&app, &shared, request)))
+            .unwrap_or_else(|_| Err(GpuFailure::new("the GPU code panicked").into()));
         if reply.as_ref().err().is_some_and(|error| error.is::<GpuFailure>()) {
             shared.discard_backend();
         }
