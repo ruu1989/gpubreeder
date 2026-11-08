@@ -4,17 +4,62 @@ const { listen } = window.__TAURI__.event;
 const $ = id => document.getElementById(id);
 const GENE_ORDER = ['G', 'Y', 'H', 'W', 'X'];
 const PRESETS = ['4G2Y', '3G3Y', '5G1Y', '2G4Y', '6G', '4G1Y1H', '3G2Y1H', 'Best score'];
-const STORE = 'gpubreeder-v1';
+const STORE = 'gpubreeder-v2';
+const OLD_STORE = 'gpubreeder-v1';
 
 const state = {
-  mix: { G: 3, Y: 3, H: 0, W: 0, X: 0 },
-  best: false,
-  plans: [],
+  tabs: [], // one per crop being bred, see newTab
+  active: null,
   sort: 'safe',
   searching: false,
-  run: null, // { index, goal, guide, cue, anchor, timerEnd, timerLength }
+  searchTab: null, // the tab whose search is running, or null for a benchmark
+  fullWater: true,
   crops: [],
 };
+
+// The Breed and Guide pages always show the active crop tab. These read and write its fields,
+// so code written for one crop works on whichever tab is showing.
+for (const key of ['mix', 'best', 'plans', 'run']) {
+  Object.defineProperty(state, key, { get: () => tab()[key], set: value => { tab()[key] = value; } });
+}
+
+function tab() {
+  return state.tabs.find(t => t.id === state.active) || state.tabs[0];
+}
+
+function tabById(id) {
+  return state.tabs.find(t => t.id === id);
+}
+
+function newTab(crop, from) {
+  return {
+    id: `t${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
+    crop,
+    paste: '',
+    mix: { G: 3, Y: 3, H: 0, W: 0, X: 0 },
+    best: false,
+    neighbours: from ? from.neighbours : '5',
+    seconds: from ? from.seconds : '60',
+    plans: [],
+    search: { rounds: [], note: '', time: '', shown: false },
+    run: null, // { index, goal, guide, cue, anchor, anchorStep, timerEnd, timerLength }
+    attention: false,
+  };
+}
+
+function cropName(key) {
+  return (state.crops.find(c => c.key === key) || { name: key }).name;
+}
+
+// Tabs are named by crop, numbered when a crop has more than one.
+function tabName(t) {
+  const same = state.tabs.filter(x => x.crop === t.crop);
+  return same.length > 1 ? `${cropName(t.crop)} ${same.indexOf(t) + 1}` : cropName(t.crop);
+}
+
+function runningTabs() {
+  return state.tabs.filter(t => t.run);
+}
 
 function genes(text, big) {
   const el = document.createElement('span');
@@ -43,8 +88,9 @@ function clock(seconds) {
   return `${m}:${String(total % 60).padStart(2, '0')}`;
 }
 
-function growing() {
-  return { crop: $('crop').value, fertilized: $('fertilized').checked, quality: Number($('quality').value) / 100 };
+// Light and heat are taken as perfect. Fertiliser and water are the two choices that vary.
+function growing(t = tab()) {
+  return { crop: t.crop, fertilized: $('fertilized').checked, fullWater: state.fullWater };
 }
 
 function mixText() {
@@ -56,13 +102,17 @@ function mixTotal() {
   return GENE_ORDER.reduce((sum, g) => sum + state.mix[g], 0);
 }
 
+// The page's inputs belong to the active tab, so they're copied back into it before saving.
 function save() {
+  const t = tab();
+  if (t) Object.assign(t, { paste: $('paste').value, neighbours: $('neighbours').value, seconds: $('seconds').value });
   try {
     localStorage.setItem(STORE, JSON.stringify({
-      paste: $('paste').value, mix: state.mix, best: state.best, crop: $('crop').value,
-      neighbours: $('neighbours').value, seconds: $('seconds').value,
-      fertilized: $('fertilized').checked, quality: $('quality').value,
-      run: state.run,
+      tabs: state.tabs.map(x => ({
+        id: x.id, crop: x.crop, paste: x.paste, mix: x.mix, best: x.best,
+        neighbours: x.neighbours, seconds: x.seconds, run: x.run,
+      })),
+      active: state.active, fertilized: $('fertilized').checked, fullWater: state.fullWater,
     }));
   } catch (_) { /* the app works without saved settings */ }
 }
@@ -70,17 +120,174 @@ function save() {
 function load() {
   try {
     const saved = JSON.parse(localStorage.getItem(STORE) || 'null');
-    if (!saved) return;
-    $('paste').value = saved.paste || '';
-    Object.assign(state.mix, saved.mix);
-    state.best = !!saved.best;
-    if (saved.crop) $('crop').value = saved.crop;
-    if (saved.neighbours) $('neighbours').value = saved.neighbours;
-    if (saved.seconds) $('seconds').value = saved.seconds;
-    $('fertilized').checked = saved.fertilized !== false;
-    if (saved.quality) $('quality').value = saved.quality;
-    state.run = saved.run || null;
+    if (saved) {
+      state.tabs = saved.tabs.map(x => Object.assign(newTab(x.crop), x, { plans: [], attention: false }));
+      state.active = saved.active;
+      $('fertilized').checked = saved.fertilized !== false;
+      state.fullWater = saved.fullWater !== false;
+    } else {
+      // Settings from before crop tabs become the first tab.
+      const old = JSON.parse(localStorage.getItem(OLD_STORE) || 'null');
+      if (old) {
+        const t = newTab(old.crop || state.crops[0].key);
+        Object.assign(t, { paste: old.paste || '', best: !!old.best, run: old.run || null });
+        Object.assign(t.mix, old.mix);
+        if (old.neighbours) t.neighbours = old.neighbours;
+        if (old.seconds) t.seconds = old.seconds;
+        state.tabs = [t];
+        $('fertilized').checked = old.fertilized !== false;
+      }
+    }
   } catch (_) { /* start fresh */ }
+  if (!state.tabs.length) state.tabs = [newTab(state.crops[0].key)];
+  if (!tabById(state.active)) state.active = state.tabs[0].id;
+  showTabInputs();
+}
+
+function showTabInputs() {
+  const t = tab();
+  $('paste').value = t.paste;
+  $('crop').value = t.crop;
+  $('neighbours').value = t.neighbours;
+  $('seconds').value = t.seconds;
+}
+
+/* ---------- crop tabs ---------- */
+
+function tabStatus(t) {
+  if (state.searching && state.searchTab === t.id) return 'Searching…';
+  if (t.closing) return state.tabs.length > 1 ? 'Press × again to remove' : 'Press × again to clear';
+  const run = t.run;
+  if (run) {
+    const step = `Step ${run.cue + 1} of ${run.guide.cues.length}`;
+    if (run.timerEnd) {
+      const left = (run.timerEnd - Date.now()) / 1000;
+      return left > 0 ? `${step} · about ${clock(left)}` : `${step} · check the plant`;
+    }
+    return `${step} · ${run.guide.cues[run.cue].headline}`;
+  }
+  const plans = t.plans.filter(p => p.guide.Ok).length;
+  if (plans) return `${plans} plan${plans === 1 ? '' : 's'} found`;
+  const clones = t.paste.split(/\s+/).filter(x => x && x !== '-').length;
+  return clones ? `${clones} clone${clones === 1 ? '' : 's'}` : 'No clones yet';
+}
+
+// A running guide whose estimate has passed needs a look, as does one the alarm flagged.
+function needsLook(t) {
+  return t.attention || !!(t.run && t.run.timerEnd && t.run.timerEnd <= Date.now());
+}
+
+function renderTabs() {
+  const strip = $('cropTabs');
+  const add = $('addCrop');
+  strip.replaceChildren();
+  for (const t of state.tabs) {
+    const button = document.createElement('button');
+    button.className = 'croptab';
+    button.dataset.id = t.id;
+    button.setAttribute('role', 'tab');
+    button.setAttribute('aria-selected', String(t.id === state.active));
+    button.classList.toggle('active', t.id === state.active);
+    const name = document.createElement('b');
+    name.textContent = tabName(t);
+    const status = document.createElement('span');
+    status.className = 'status';
+    button.append(name, status);
+    const close = document.createElement('span');
+    close.className = 'close';
+    close.textContent = '×';
+    close.title = state.tabs.length > 1 ? `Remove ${tabName(t)}` : `Clear ${tabName(t)} and start fresh`;
+    close.onclick = event => { event.stopPropagation(); removeTab(t.id); };
+    button.append(close);
+    button.onclick = () => switchTab(t.id);
+    strip.append(button);
+  }
+  strip.append(add);
+  updateTabs();
+  const running = runningTabs();
+  $('navGuide').textContent = running.length > 1 ? `${running.length} guides running` : running.length ? `Making ${running[0].run.goal}` : 'No plan yet';
+}
+
+// Refreshes each tab's status line without rebuilding the strip.
+function updateTabs() {
+  for (const button of $('cropTabs').querySelectorAll('.croptab')) {
+    const t = tabById(button.dataset.id);
+    if (!t) continue;
+    button.querySelector('.status').textContent = tabStatus(t);
+    button.classList.toggle('alert', t.id !== state.active && needsLook(t));
+    button.classList.toggle('running', !!t.run);
+  }
+}
+
+function switchTab(id) {
+  if (id === state.active || !tabById(id)) return;
+  save();
+  state.active = id;
+  tab().attention = false;
+  showTabInputs();
+  showError('');
+  renderMix();
+  renderHealth();
+  readPaste();
+  renderSearchPanel();
+  renderPlans();
+  track.shown = -1;
+  renderGuide();
+  renderTabs();
+  save();
+}
+
+function addTab(crop) {
+  const t = newTab(crop, tab());
+  state.tabs.push(t);
+  switchTab(t.id);
+}
+
+// Removing a tab with clones, plans or a guide takes a second press. The last tab is cleared
+// instead, so there's always one to work in.
+function removeTab(id) {
+  const t = tabById(id);
+  if (!t || (state.searching && state.searchTab === id)) return;
+  const busy = t.run || t.plans.length || t.paste.trim();
+  if (busy && !t.closing) {
+    t.closing = setTimeout(() => { t.closing = null; updateTabs(); }, 3000);
+    updateTabs();
+    return;
+  }
+  clearTimeout(t.closing);
+  t.closing = null;
+  invoke('forget_tab', { tab: id });
+  if (state.tabs.length < 2) {
+    clearTab(t);
+    return;
+  }
+  const at = state.tabs.indexOf(t);
+  state.tabs.splice(at, 1);
+  if (state.active === id) {
+    state.active = null;
+    switchTab(state.tabs[Math.max(0, at - 1)].id);
+  }
+  applyHotkey();
+  renderTabs();
+  save();
+}
+
+// Empties a tab's clones, plans, search and guide. Its crop, target and settings stay.
+function clearTab(t) {
+  Object.assign(t, { paste: '', plans: [], run: null, attention: false, search: { rounds: [], note: '', time: '', shown: false } });
+  invoke('disarm_alarm', { tab: t.id });
+  if (t.id === state.active) {
+    scan.taken = ''; // so a clone scanned just before can be taken again
+    showTabInputs();
+    showError('');
+    readPaste();
+    renderSearchPanel();
+    renderPlans();
+    renderGuide();
+  }
+  applyHotkey();
+  renderTabs();
+  save();
 }
 
 /* ---------- breed tab ---------- */
@@ -117,8 +324,23 @@ function renderMix() {
     button.onclick = () => applyPreset(name);
     presets.append(button);
   }
-  $('go').disabled = !state.best && total !== 6;
+  renderGo();
   save();
+}
+
+// One search runs at a time, because every tab shares the GPU.
+function renderGo() {
+  const go = $('go');
+  const mine = state.searching && state.searchTab === state.active;
+  go.classList.toggle('stop', mine);
+  if (state.searching && !mine) {
+    const other = tabById(state.searchTab);
+    go.textContent = other ? `Searching ${tabName(other)}…` : 'Find plans';
+    go.disabled = true;
+    return;
+  }
+  go.textContent = mine ? 'Stop and show what was found' : 'Find plans';
+  go.disabled = !mine && !state.best && mixTotal() !== 6;
 }
 
 function bump(gene, by) {
@@ -300,16 +522,16 @@ async function search() {
     return;
   }
   showError('');
-  $('rounds').replaceChildren();
-  $('searchNote').textContent = 'Starting the GPU…';
-  $('searchTime').textContent = '';
-  $('roundsPanel').hidden = false;
+  const t = tab();
+  t.search = { rounds: [], note: 'Starting the GPU…', time: '', shown: true };
   state.plans = [];
   renderPlans();
+  state.searchTab = t.id;
   setSearching(true);
+  renderSearchPanel();
   try {
     await invoke('start_search', { request: {
-      plants: $('paste').value, mix: mixText(), neighbours: Number($('neighbours').value),
+      tab: t.id, plants: $('paste').value, mix: mixText(), neighbours: Number($('neighbours').value),
       seconds: Number($('seconds').value), ...growing(),
     } });
   } catch (error) {
@@ -319,34 +541,62 @@ async function search() {
 }
 
 let searchClock = null;
+const searchSpan = { end: 0, seconds: 0 };
 
 function stopSearchClock() {
   clearInterval(searchClock);
+  searchClock = null;
   $('searchClock').hidden = true;
 }
 
 // The limit is a ceiling: a search that reaches its target or runs out of routes ends sooner.
 function startSearchClock(seconds) {
   stopSearchClock();
-  const end = performance.now() + seconds * 1000;
-  const show = () => {
-    const left = Math.max(0, (end - performance.now()) / 1000);
-    const whole = Math.ceil(left);
-    $('searchBar').style.width = `${100 * (1 - left / seconds)}%`;
-    $('searchLeft').textContent = left > 0
-      ? `Up to ${Math.floor(whole / 60)}:${String(whole % 60).padStart(2, '0')} left, less if it finishes sooner`
-      : 'Time is up. Finishing the last batch…';
-  };
-  $('searchClock').hidden = false;
-  show();
-  searchClock = setInterval(show, 100);
+  Object.assign(searchSpan, { end: performance.now() + seconds * 1000, seconds });
+  searchClock = setInterval(showSearchClock, 100);
+  showSearchClock();
+}
+
+// The clock shows only on the tab that's searching.
+function showSearchClock() {
+  const here = state.searching && state.searchTab === state.active && searchClock;
+  $('searchClock').hidden = !here;
+  if (!here) return;
+  const left = Math.max(0, (searchSpan.end - performance.now()) / 1000);
+  const whole = Math.ceil(left);
+  $('searchBar').style.width = `${100 * (1 - left / searchSpan.seconds)}%`;
+  $('searchLeft').textContent = left > 0
+    ? `Up to ${Math.floor(whole / 60)}:${String(whole % 60).padStart(2, '0')} left, less if it finishes sooner`
+    : 'Time is up. Finishing the last batch…';
+}
+
+function roundItem(r) {
+  const li = document.createElement('li');
+  const left = document.createElement('b');
+  left.textContent = `${r.crossings} crossing${r.crossings === 1 ? '' : 's'}`;
+  const right = document.createElement('span');
+  right.textContent = `${r.new_genotypes.toLocaleString()} new · ${r.seconds.toFixed(2)}s${r.complete ? '' : ' · cut short'}`;
+  li.append(left, right);
+  return li;
+}
+
+function renderSearchPanel() {
+  const s = tab().search;
+  $('roundsPanel').hidden = !s.shown;
+  $('rounds').replaceChildren(...s.rounds.map(roundItem));
+  $('searchNote').textContent = s.note;
+  $('searchTime').textContent = s.time;
+  showSearchClock();
 }
 
 function setSearching(on) {
   state.searching = on;
-  if (!on) stopSearchClock();
-  $('go').textContent = on ? 'Stop and show what was found' : 'Find plans';
-  $('go').classList.toggle('stop', on);
+  if (!on) {
+    stopSearchClock();
+    state.searchTab = null;
+  }
+  renderGo();
+  renderTabs();
 }
 
 function sortedPlans() {
@@ -448,6 +698,7 @@ function beginRun(plan) {
   applyHotkey();
   switchView('guide');
   enterCue();
+  renderTabs();
 }
 
 function cue() {
@@ -456,16 +707,16 @@ function cue() {
 
 // Estimates count from when this crossing's centre was confirmed. Without that there is none,
 // and the cue's condition is all there is to go by.
-function estimateEnd(c) {
-  const run = state.run;
+function estimateEnd(c, run = state.run) {
   if (c.kind !== 'wait' || !run.anchor || run.anchorStep !== c.step) return null;
   return run.anchor + c.wait_until * 1000;
 }
 
-function armAlarm() {
-  const left = (state.run.timerEnd - Date.now()) / 1000;
-  if (state.run.timerEnd && left > 0) invoke('arm_alarm', { seconds: left });
-  else invoke('disarm_alarm');
+// Each tab has its own alarm, so guides for several crops can run at once.
+function armAlarm(t = tab()) {
+  const left = t.run ? (t.run.timerEnd - Date.now()) / 1000 : 0;
+  if (t.run && t.run.timerEnd && left > 0) invoke('arm_alarm', { tab: t.id, seconds: left });
+  else invoke('disarm_alarm', { tab: t.id });
 }
 
 function enterCue() {
@@ -496,7 +747,7 @@ function advance() {
     run.multiplyDone = true;
     run.timerEnd = Date.now() + c.timer_seconds * 1000;
     run.timerLength = c.timer_seconds * 1000;
-    invoke('arm_alarm', { seconds: c.timer_seconds });
+    invoke('arm_alarm', { tab: tab().id, seconds: c.timer_seconds });
     speak('Timer started.');
     save();
     renderGuide();
@@ -517,10 +768,11 @@ function advance() {
 
 function endRun() {
   state.run = null;
-  invoke('disarm_alarm');
-  invoke('set_hotkey', { on: false });
+  invoke('disarm_alarm', { tab: tab().id });
+  applyHotkey();
   save();
   renderGuide();
+  renderTabs();
 }
 
 let audio = null;
@@ -568,7 +820,8 @@ function spoken(c) {
 function announce(c) {
   if (c.kind === 'prepare') return;
   if (c.kind !== 'wait') chime();
-  speak(spoken(c));
+  // With several guides running, each cue says which crop it's for.
+  speak(runningTabs().length > 1 ? `${tabName(tab())}. ${spoken(c)}` : spoken(c));
 }
 
 function needRow(need) {
@@ -708,8 +961,14 @@ function renderGuide() {
   const run = state.run;
   $('guideEmpty').hidden = !!run;
   $('guide').hidden = !run;
-  $('navGuide').textContent = run ? `Making ${run.goal}` : 'No plan yet';
-  if (!run) return;
+  if (!run) {
+    const others = runningTabs().map(tabName);
+    $('guideEmptyTitle').textContent = `No plan running for ${tabName(tab())}`;
+    $('guideEmptyText').textContent = others.length
+      ? `${others.join(' and ')} ${others.length === 1 ? 'has a guide' : 'have guides'} running. Pick a tab above, or start a plan for this crop on the Breed page.`
+      : 'Pick a plan on the Breed page and press Start guide.';
+    return;
+  }
   const c = cue();
   const steps = run.guide.windows.length;
   const card = placeTrack(run);
@@ -801,6 +1060,7 @@ function renderPlanter(c) {
 }
 
 function tick() {
+  updateTabs();
   const run = state.run;
   if (!run) return;
   const c = cue();
@@ -821,16 +1081,28 @@ function tick() {
   if (overdue) late.textContent = 'By the estimate, the centre could be close to Crossbreed. Check it hasn\'t reached Crossbreed before you plant more.';
 }
 
-// The estimate only prompts a look at the plant. Moving on is always the player's call.
-function alarmFired() {
-  if (!state.run) return;
-  const c = cue();
-  if (c.kind === 'wait') { chime(); speak('Check the centre plant.'); renderGuide(); }
-  else if (c.kind === 'multiply') { chime(); speak('Check whether the plants have reached Sapling.'); renderGuide(); }
+// The estimate only prompts a look at the plant. Moving on is always the player's call. An alarm
+// for another tab names its crop and marks that tab.
+function alarmFired(id) {
+  const t = tabById(id);
+  if (!t || !t.run) return;
+  const c = t.run.guide.cues[t.run.cue];
+  const words = c.kind === 'wait' ? 'Check the centre plant.' : c.kind === 'multiply' ? 'Check whether the plants have reached Sapling.' : null;
+  if (!words) return;
+  chime();
+  if (t.id === state.active) {
+    speak(runningTabs().length > 1 ? `${tabName(t)}. ${words}` : words);
+    renderGuide();
+  } else {
+    t.attention = true;
+    speak(`${tabName(t)}. ${words}`);
+    updateTabs();
+  }
 }
 
+// F9 confirms the current cue of the guide on screen, and stays claimed while any guide runs.
 function applyHotkey() {
-  invoke('set_hotkey', { on: !!state.run && $('optHotkey').checked }).catch(error => {
+  invoke('set_hotkey', { on: runningTabs().length > 0 && $('optHotkey').checked }).catch(error => {
     $('optHotkey').checked = false;
     showError(`F9 is in use by another app: ${error}`);
   });
@@ -839,9 +1111,9 @@ function applyHotkey() {
 /* ---------- grow times ---------- */
 
 async function renderTimes() {
-  const { fertilized, quality } = growing();
-  const tables = await invoke('grow_table', { fertilized, quality });
-  $('timesNote').textContent = `Minutes from planting, at ${fertilized ? 'fertilised' : 'unfertilised'} planter conditions and ${Math.round(quality * 100)}% light, water and heat. Plants move in 60-second ticks, each up to 10% early or late.`;
+  const { fertilized, fullWater } = growing();
+  const tables = await invoke('grow_table', { fertilized, fullWater });
+  $('timesNote').textContent = `Minutes from planting, in a planter ${fertilized ? 'with' : 'without'} fertiliser, ${fullWater ? 'kept full of water' : 'kept near its ideal water level'}, with perfect light and heat. Plants move in 60-second ticks, each up to 10% early or late.`;
   const box = $('times');
   box.replaceChildren();
   const seen = new Map();
@@ -929,33 +1201,35 @@ function switchView(name) {
   }
 }
 
-// Health as the game shows it: the lowest of light, water, ground and temperature. A planter's
-// ground is full only with fertiliser, and how full that is depends on the crop.
+// Health as the game shows it: the lowest of light, water, ground and temperature. Light and
+// heat are taken as perfect. A planter's ground is full only with fertiliser, a full planter
+// waters at 0.6, and both are measured against what the crop wants.
 function renderHealth() {
-  const { crop, fertilized, quality } = growing();
+  const { crop, fertilized, fullWater } = growing();
   const info = state.crops.find(c => c.key === crop);
   if (!info) return;
   const ground = Math.min(1, (fertilized ? 1 : 0.6) / info.optimal_ground);
-  const health = Math.min(ground, quality);
-  $('health').textContent = `Health ${Math.round(health * 100)}%, the lowest of ground (${Math.round(ground * 100)}%${fertilized ? '' : ' without fertiliser'}) and light, water and heat (${Math.round(quality * 100)}%). Timers use this, so match it to what the game shows.`;
+  const water = fullWater ? Math.min(1, 0.6 / info.optimal_water) : 1;
+  const health = Math.min(ground, water);
+  for (const b of document.querySelectorAll('[data-water]')) b.classList.toggle('active', (b.dataset.water === 'full') === fullWater);
+  $('health').textContent = `${info.name} should show ${Math.round(health * 100)}% health: ground ${Math.round(ground * 100)}%${fertilized ? '' : ' without fertiliser'}, water ${Math.round(water * 100)}%${fullWater ? ' in a full planter' : ''}, with light and heat taken as perfect. Timings use this.`;
 }
 
 // A running guide takes new timings for the same plan. A wait in progress moves its end time.
-function refreshRun() {
-  const run = state.run;
+function refreshRun(t = tab()) {
+  const run = t.run;
   if (!run) return;
-  const plan = state.plans.find(p => p.index === run.index && p.goal === run.goal) || state.plans.find(p => p.goal === run.goal);
+  const plan = t.plans.find(p => p.index === run.index && p.goal === run.goal) || t.plans.find(p => p.goal === run.goal);
   const guide = plan && plan.guide.Ok;
   if (!guide || guide.cues.length !== run.guide.cues.length) return;
   run.guide = guide;
-  const c = cue();
+  const c = guide.cues[run.cue];
   if (c.kind === 'wait') {
-    run.timerEnd = estimateEnd(c);
+    run.timerEnd = estimateEnd(c, run);
     if (run.timerEnd) run.timerLength = c.wait_until * 1000;
-    armAlarm();
+    armAlarm(t);
   }
   save();
-  renderGuide();
 }
 
 async function startBenchmark() {
@@ -967,8 +1241,9 @@ async function startBenchmark() {
     return;
   }
   state.searching = true;
+  state.searchTab = null;
   $('bench').disabled = true;
-  $('go').disabled = true;
+  renderGo();
   $('benchNote').textContent = 'Measuring. This takes about 10 seconds…';
 }
 
@@ -979,25 +1254,35 @@ function endBenchmark(text) {
   $('benchNote').textContent = text;
 }
 
-async function replan() {
+// Fertiliser and water apply to every tab. The crop belongs to the tab showing.
+async function replan(everyTab) {
   save();
   renderHealth();
+  renderTabs();
   await readPaste();
   if (!$('view-times').hidden) renderTimes();
-  if (state.plans.length) {
-    state.plans = await invoke('replan', growing());
-    renderPlans();
-    refreshRun();
+  for (const t of everyTab ? state.tabs : [tab()]) {
+    if (!t.plans.length) continue;
+    t.plans = await invoke('replan', { tab: t.id, ...growing(t) });
+    refreshRun(t);
   }
+  renderPlans();
+  renderGuide();
 }
 
 async function main() {
   const crops = await invoke('crops');
   state.crops = crops;
   for (const crop of crops) $('crop').add(new Option(crop.name, crop.key));
+  const add = $('addCrop');
+  add.add(new Option('+ Add crop', ''));
+  for (const crop of crops) add.add(new Option(crop.name, crop.key));
+  add.onchange = () => { if (add.value) addTab(add.value); add.value = ''; };
   load();
+  renderTabs();
   renderHealth();
   renderMix();
+  renderSearchPanel();
   readPaste();
 
   for (const button of document.querySelectorAll('.nav')) button.onclick = () => switchView(button.dataset.view);
@@ -1015,11 +1300,12 @@ async function main() {
   $('bench').onclick = startBenchmark;
   $('scan').onclick = () => invoke('open_rust_breeder');
   $('credit').onclick = () => invoke('open_rust_breeder');
-  for (const id of ['crop', 'fertilized']) $(id).onchange = replan;
+  $('crop').onchange = () => { tab().crop = $('crop').value; replan(false); };
+  $('fertilized').onchange = () => replan(true);
+  for (const b of document.querySelectorAll('[data-water]')) {
+    b.onclick = () => { state.fullWater = b.dataset.water === 'full'; replan(true); };
+  }
   for (const id of ['neighbours', 'seconds']) $(id).onchange = save;
-  $('quality').oninput = () => { $('qualityOut').textContent = `${$('quality').value}%`; renderHealth(); };
-  $('quality').onchange = replan;
-  $('qualityOut').textContent = `${$('quality').value}%`;
   $('testSound').onclick = () => { chime(); speak('Plant this now.'); };
   let quitArmed = null;
   $('quitGuide').onclick = () => {
@@ -1040,47 +1326,59 @@ async function main() {
   $('optHotkey').onchange = () => { applyHotkey(); renderGuide(); };
 
   await listen('telemetry', telemetry);
-  await listen('alarm', alarmFired);
+  await listen('alarm', ({ payload }) => alarmFired(payload));
   await listen('hotkey-next', advance);
   await listen('search-started', ({ payload: seconds }) => startSearchClock(seconds));
+  // Search results belong to the tab that started the search, even if another is showing now.
   await listen('search-round', ({ payload: r }) => {
-    const li = document.createElement('li');
-    const left = document.createElement('b');
-    left.textContent = `${r.crossings} crossing${r.crossings === 1 ? '' : 's'}`;
-    const right = document.createElement('span');
-    right.textContent = `${r.new_genotypes.toLocaleString()} new · ${r.seconds.toFixed(2)}s${r.complete ? '' : ' · cut short'}`;
-    li.append(left, right);
-    $('rounds').append(li);
-    $('searchNote').textContent = `${r.known.toLocaleString()} plants reachable so far. Trying ${r.crossings + 1} crossings…`;
+    const t = tabById(state.searchTab);
+    if (!t) return;
+    t.search.rounds.push(r);
+    t.search.note = `${r.known.toLocaleString()} plants reachable so far. Trying ${r.crossings + 1} crossings…`;
+    if (t.id === state.active) renderSearchPanel();
   });
   await listen('benchmark-done', ({ payload: b }) => endBenchmark(
     `Top speed ${compact(b.best)} groups/s, median ${compact(b.median)}, over ${b.runs} runs on ${b.device}. ` +
     'Every machine runs the same 100-clone work, so results compare.'));
   await listen('benchmark-failed', ({ payload }) => endBenchmark(`Benchmark failed: ${payload}`));
   await listen('search-failed', ({ payload }) => {
+    const t = tabById(state.searchTab);
     setSearching(false);
-    $('roundsPanel').hidden = true;
-    showError(payload);
+    if (!t) return;
+    t.search.shown = false;
+    if (t.id === state.active) {
+      renderSearchPanel();
+      showError(payload);
+    } else {
+      t.search.note = payload;
+    }
   });
   await listen('search-done', ({ payload: r }) => {
+    const t = tabById(state.searchTab);
     setSearching(false);
+    if (!t) return;
+    const s = t.search;
     if (r.already_have) {
-      $('searchNote').textContent = `You already have ${r.already_have}, which meets this target.`;
-      return;
-    }
-    state.plans = r.plans;
-    $('searchTime').textContent = `${r.seconds.toFixed(1)}s on ${r.device}`;
-    const n = r.proven_up_to;
-    const span = `${n} crossing${n === 1 ? '' : 's'}`;
-    const best = r.plans.length ? r.plans[0].crossings : 0;
-    const proven = best > 0 && best <= n + 1 && !r.stopped;
-    if (r.reached_goal) {
-      $('searchNote').textContent = proven ? `This is the minimum: every route up to ${span} was searched at this neighbour limit.` : 'A shorter route may exist, because the search ended early.';
+      s.note = `You already have ${r.already_have}, which meets this target.`;
     } else {
-      const ruled = n ? `No route within ${span} at this neighbour limit. ` : '';
-      $('searchNote').textContent = `Target not reached. ${ruled}Try a longer search or more neighbours.`;
+      t.plans = r.plans;
+      s.time = `${r.seconds.toFixed(1)}s on ${r.device}`;
+      const n = r.proven_up_to;
+      const span = `${n} crossing${n === 1 ? '' : 's'}`;
+      const best = r.plans.length ? r.plans[0].crossings : 0;
+      const proven = best > 0 && best <= n + 1 && !r.stopped;
+      if (r.reached_goal) {
+        s.note = proven ? `This is the minimum: every route up to ${span} was searched at this neighbour limit.` : 'A shorter route may exist, because the search ended early.';
+      } else {
+        const ruled = n ? `No route within ${span} at this neighbour limit. ` : '';
+        s.note = `Target not reached. ${ruled}Try a longer search or more neighbours.`;
+      }
     }
-    renderPlans();
+    if (t.id === state.active) {
+      renderSearchPanel();
+      renderPlans();
+    }
+    renderTabs();
   });
 
   $('prevCue').onclick = () => state.run && goTo(state.run.cue - 1);
@@ -1091,12 +1389,14 @@ async function main() {
     if (event.key === 'PageDown') { event.preventDefault(); goTo(state.run.cue + 1); }
   });
 
-  if (state.run) {
+  for (const t of runningTabs()) {
     // Guides saved before estimates were tied to a crossing belong to the current one.
-    if (state.run.anchor && state.run.anchorStep === undefined) state.run.anchorStep = cue().step;
+    if (t.run.anchor && t.run.anchorStep === undefined) t.run.anchorStep = t.run.guide.cues[t.run.cue].step;
+    armAlarm(t);
+  }
+  if (runningTabs().length) {
     applyHotkey();
     switchView('guide');
-    armAlarm();
   }
   setInterval(tick, 250);
 }

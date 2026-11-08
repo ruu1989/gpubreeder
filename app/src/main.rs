@@ -15,6 +15,7 @@ use gpubreeder::plan::*;
 use gpubreeder::search::*;
 use gpubreeder::timing::*;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -25,16 +26,19 @@ use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Shortcut, ShortcutSt
 /// Plans listed after a search. Arrangements of the same mix often tie.
 const PLANS_SHOWN: usize = 12;
 
-/// The last search's plans, the starting plants they used, and where each plant is stored.
+/// A search's plans, the starting plants they used, and where each plant is stored.
 type Results = (Vec<Plan>, Vec<Genotype>, Places);
 
 #[derive(Default)]
 struct Shared {
     backend: Mutex<Option<GpuBackend>>,
-    results: Mutex<Option<Results>>,
+    /// The last search on each crop tab, by the tab's id.
+    results: Mutex<HashMap<String, Results>>,
     control: Mutex<Option<Arc<SearchControl>>>,
     searching: AtomicBool,
-    alarm: AtomicU64,
+    /// Each tab's armed alarm, by ticket. A newer ticket or a removal cancels the older one.
+    alarms: Mutex<HashMap<String, u64>>,
+    tickets: AtomicU64,
 }
 
 impl Shared {
@@ -77,7 +81,7 @@ fn crops() -> Vec<Crop> {
 }
 
 #[tauri::command]
-fn read_plants(pasted: String, crop: String, fertilized: bool, quality: f32) -> Result<PastedReply, String> {
+fn read_plants(pasted: String, crop: String, fertilized: bool, full_water: bool) -> Result<PastedReply, String> {
     let crop = crop_by_key(&crop).map_err(text)?;
     let parsed = parse_pasted(&pasted);
     let places = guide::places_of(&parsed.scanned);
@@ -85,7 +89,7 @@ fn read_plants(pasted: String, crop: String, fertilized: bool, quality: f32) -> 
     let mut plants = Vec::with_capacity(parsed.plants.len());
     for plant in parsed.plants {
         let g = plant.genes().iter().filter(|&&gene| gene == G).count() as u32;
-        let to_crossbreed_minutes = Timeline::new(crop, g, conditions(fertilized, quality)).map_err(text)?.to_crossbreed();
+        let to_crossbreed_minutes = Timeline::new(crop, g, conditions(fertilized, full_water)).map_err(text)?.to_crossbreed();
         plants.push(PastedPlant {
             genes: plant.to_string(),
             g,
@@ -97,7 +101,10 @@ fn read_plants(pasted: String, crop: String, fertilized: bool, quality: f32) -> 
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SearchRequest {
+    /// The crop tab this search belongs to.
+    tab: String,
     plants: String,
     /// A mix like 3G3Y. Empty means the highest score reachable in the time allowed.
     mix: String,
@@ -105,7 +112,7 @@ struct SearchRequest {
     seconds: f64,
     crop: String,
     fertilized: bool,
-    quality: f32,
+    full_water: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -146,8 +153,10 @@ struct SearchReply {
     stopped: bool,
 }
 
-fn conditions(fertilized: bool, quality: f32) -> Conditions {
-    Conditions { fertilized, other_quality: quality.clamp(0.0, 1.0) }
+/// Light and heat are taken as perfect, which most players manage. Fertiliser and water are
+/// the two that vary.
+fn conditions(fertilized: bool, full_water: bool) -> Conditions {
+    Conditions { fertilized, full_water, other_quality: 1.0 }
 }
 
 fn plan_view(index: usize, plan: &Plan, inputs: &[Genotype], places: &Places, crop: &Crop, conditions: Conditions) -> PlanView {
@@ -179,7 +188,7 @@ fn run_search(app: &AppHandle, shared: &Shared, request: SearchRequest) -> Resul
         mix => Some(Goal::Mix(GeneMix::parse(mix)?)),
     };
     let crop = crop_by_key(&request.crop)?;
-    let growing = conditions(request.fertilized, request.quality);
+    let growing = conditions(request.fertilized, request.full_water);
     let already_have = goal.and_then(|goal| inputs.iter().find(|&&g| goal.matches(g))).map(Genotype::to_string);
     if already_have.is_some() {
         return Ok(SearchReply {
@@ -235,7 +244,7 @@ fn run_search(app: &AppHandle, shared: &Shared, request: SearchRequest) -> Resul
         device,
         stopped: control.cancel.load(Ordering::Relaxed),
     };
-    *shared.results.lock().map_err(|_| anyhow!("search state was poisoned"))? = Some((plans, outcome.inputs, places));
+    shared.results.lock().map_err(|_| anyhow!("search state was poisoned"))?.insert(request.tab, (plans, outcome.inputs, places));
     Ok(reply)
 }
 
@@ -323,15 +332,15 @@ fn stop_search(shared: State<Arc<Shared>>) {
     }
 }
 
-/// Rebuilds the plan list after the crop or growing conditions change.
+/// Rebuilds a tab's plan list after its crop or the growing conditions change.
 #[tauri::command]
-fn replan(shared: State<Arc<Shared>>, crop: String, fertilized: bool, quality: f32) -> Result<Vec<PlanView>, String> {
+fn replan(shared: State<Arc<Shared>>, tab: String, crop: String, fertilized: bool, full_water: bool) -> Result<Vec<PlanView>, String> {
     let crop = crop_by_key(&crop).map_err(text)?;
     let results = shared.results.lock().map_err(|_| "search state was poisoned")?;
-    let Some((plans, inputs, places)) = results.as_ref() else {
+    let Some((plans, inputs, places)) = results.get(&tab) else {
         return Ok(Vec::new());
     };
-    let growing = conditions(fertilized, quality);
+    let growing = conditions(fertilized, full_water);
     Ok(plans.iter().enumerate().map(|(i, p)| plan_view(i, p, inputs, places, crop, growing)).collect())
 }
 
@@ -352,8 +361,8 @@ struct GrowTable {
 }
 
 #[tauri::command]
-fn grow_table(fertilized: bool, quality: f32) -> Result<Vec<GrowTable>, String> {
-    let growing = conditions(fertilized, quality);
+fn grow_table(fertilized: bool, full_water: bool) -> Result<Vec<GrowTable>, String> {
+    let growing = conditions(fertilized, full_water);
     let table = |crop: &Crop| -> Result<GrowTable> {
         let rows = (0..=SLOTS as u32).map(|g| {
             let t = Timeline::new(crop, g, growing)?;
@@ -364,15 +373,31 @@ fn grow_table(fertilized: bool, quality: f32) -> Result<Vec<GrowTable>, String> 
     CROPS.iter().map(table).collect::<Result<_>>().map_err(text)
 }
 
-/// Timers live here so they still fire while the window is behind the game.
+/// Forgets a closed tab's plans.
 #[tauri::command]
-fn arm_alarm(app: AppHandle, seconds: f64) {
+fn forget_tab(shared: State<Arc<Shared>>, tab: String) {
+    if let Ok(mut results) = shared.results.lock() {
+        results.remove(&tab);
+    }
+    if let Ok(mut alarms) = shared.alarms.lock() {
+        alarms.remove(&tab);
+    }
+}
+
+/// Timers live here so they still fire while the window is behind the game. Each crop tab has
+/// its own, so several guides can run at once.
+#[tauri::command]
+fn arm_alarm(app: AppHandle, tab: String, seconds: f64) {
     let shared = app.state::<Arc<Shared>>().inner().clone();
-    let ticket = shared.alarm.fetch_add(1, Ordering::SeqCst) + 1;
+    let ticket = shared.tickets.fetch_add(1, Ordering::SeqCst) + 1;
+    if let Ok(mut alarms) = shared.alarms.lock() {
+        alarms.insert(tab.clone(), ticket);
+    }
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs_f64(seconds.max(0.0)));
-        if shared.alarm.load(Ordering::SeqCst) == ticket {
-            let _ = app.emit("alarm", ());
+        let current = shared.alarms.lock().map(|alarms| alarms.get(&tab) == Some(&ticket)).unwrap_or(false);
+        if current {
+            let _ = app.emit("alarm", tab);
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.request_user_attention(Some(tauri::UserAttentionType::Informational));
             }
@@ -381,8 +406,10 @@ fn arm_alarm(app: AppHandle, seconds: f64) {
 }
 
 #[tauri::command]
-fn disarm_alarm(shared: State<Arc<Shared>>) {
-    shared.alarm.fetch_add(1, Ordering::SeqCst);
+fn disarm_alarm(shared: State<Arc<Shared>>, tab: String) {
+    if let Ok(mut alarms) = shared.alarms.lock() {
+        alarms.remove(&tab);
+    }
 }
 
 #[tauri::command]
@@ -433,6 +460,7 @@ fn main() {
             grow_table,
             arm_alarm,
             disarm_alarm,
+            forget_tab,
             set_always_on_top,
             set_hotkey,
             open_rust_breeder,

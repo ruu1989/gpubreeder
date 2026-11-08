@@ -46,6 +46,10 @@ at any resolution. No Rust Breeder code is copied here. See [NOTICE.md](NOTICE.m
   that happens from real grow times for your planter, but only as a prompt to go and look. You
   move on when the plant matches, and can step back or skip at any time. A voice, a chime and an
   F9 hotkey let you stay in the game.
+- **Breeds several crops at once.** Each crop gets its own tab, with its own clones, target, plans
+  and guide. Guides for every tab can run together. Each tab shows its current step and estimate,
+  and an alarm for a tab you're not looking at names its crop. Set fertiliser and water once, as
+  **Use fertiliser** and **Max water** or **Optimise water**, and every timing follows.
 
 ![The guide, with the current cue in focus and the next one dimmed below it](docs/images/guide.png)
 

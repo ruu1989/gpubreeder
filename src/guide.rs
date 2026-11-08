@@ -286,10 +286,11 @@ pub fn build(plan: &Plan, inputs: &[Genotype], places: &Places, crop: &Crop, con
         "Gather your clones".into(),
         format!(
             "You need {}. Bring {}, and use an empty planter. Each step says what to look for on the plant before you go on. \
-             Its percentages and the timer assume {} with {:.0}% health, so check the planter shows that. The timer is only an estimate.",
+             Its percentages and the timer assume {} {}, with {:.0}% health, so check the planter shows that. The timer is only an estimate.",
             gather.join(", "),
             if conditions.fertilized { "water and fertiliser" } else { "water" },
             if conditions.fertilized { "a fertilised planter" } else { "a planter without fertiliser" },
+            if conditions.full_water { "kept full of water" } else { "kept near its ideal water level" },
             quality * 100.0
         ),
     );
@@ -304,7 +305,11 @@ pub fn build(plan: &Plan, inputs: &[Genotype], places: &Places, crop: &Crop, con
         windows.push(window);
         let order_note = if order_matters(step) { "Planting order matters here." } else { "Any order works here." };
 
-        let detail = "Remove every plant of this crop from the planter, and water it to about 60%, not full. Then plant this in the middle. The estimate starts when you confirm.";
+        let detail = if conditions.full_water {
+            "Remove every plant of this crop from the planter, and fill it with water. Then plant this in the middle. The estimate starts when you confirm."
+        } else {
+            "Remove every plant of this crop from the planter, and water it to about 60%, not full. Then plant this in the middle. The estimate starts when you confirm."
+        };
         let mut plant = Cue::new(CueKind::PlantCentre, number, "Plant the centre".into(), detail.into());
         plant.plants = vec![centre.to_string()];
         plant.places = stored(centre);
@@ -423,8 +428,14 @@ pub fn build(plan: &Plan, inputs: &[Genotype], places: &Places, crop: &Crop, con
     cues.push(finish);
 
     let mut notes = Vec::new();
-    if !conditions.fertilized {
-        notes.push(format!("Without fertiliser, {} grows at {:.0}% speed in a planter.", crop.name, quality * 100.0));
+    if quality < 1.0 {
+        let why = match (conditions.ground(crop) < 1.0, conditions.water(crop) < 1.0) {
+            (true, true) => "Without fertiliser and in a full planter",
+            (true, false) => "Without fertiliser",
+            (false, true) => "In a full planter",
+            (false, false) => "With less than perfect light or heat",
+        };
+        notes.push(format!("{why}, {} grows at {:.0}% speed.", crop.name, quality * 100.0));
     }
     let wet_low = 0.6 * crop.optimal_water * 100.0;
     let wet_high = (1.6 - crop.optimal_water) * 100.0;
@@ -564,7 +575,7 @@ mod tests {
         let steps =
             vec![Recipe { result: made, order: vec![a], centre: Some(b) }, Recipe { result: goal, order: vec![made], centre: Some(b) }];
         let plan = Plan { goal, generation: 2, steps, inputs_used: vec![a, b] };
-        let plain = Conditions { fertilized: false, other_quality: 1.0 };
+        let plain = Conditions { fertilized: false, full_water: false, other_quality: 1.0 };
         let guide = build(&plan, &[a, b], &Places::new(), crop_by_key("hemp").unwrap(), plain).unwrap();
         for cue in guide.cues.iter().filter(|c| matches!(c.kind, CueKind::Wait | CueKind::Multiply | CueKind::PlantNeighbour)) {
             assert!(cue.condition.is_some(), "{} has no condition", cue.headline);

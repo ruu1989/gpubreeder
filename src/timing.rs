@@ -74,17 +74,30 @@ pub fn crop_by_key(key: &str) -> Result<&'static Crop> {
 pub struct Conditions {
     /// A planter gives ground quality 0.6, or 1.0 with fertiliser.
     pub fertilized: bool,
-    /// The lowest of the light, water and temperature qualities, 0 to 1.
+    /// A full planter, which waters worse than one kept near its ideal level.
+    pub full_water: bool,
+    /// The lower of the light and temperature qualities, 0 to 1.
     pub other_quality: f32,
 }
 
 impl Conditions {
-    pub const PERFECT: Conditions = Conditions { fertilized: true, other_quality: 1.0 };
+    pub const PERFECT: Conditions = Conditions { fertilized: true, full_water: false, other_quality: 1.0 };
 
     /// The game takes the worst of the four qualities.
     pub fn quality(self, crop: &Crop) -> f32 {
+        self.ground(crop).min(self.water(crop)).min(self.other_quality)
+    }
+
+    /// A planter's ground is 0.6, or 1.0 with fertiliser, measured against what the crop wants.
+    pub fn ground(self, crop: &Crop) -> f32 {
         let ground: f32 = if self.fertilized { 1.0 } else { 0.6 };
-        (ground / crop.optimal_ground).min(1.0).min(self.other_quality)
+        (ground / crop.optimal_ground).min(1.0)
+    }
+
+    /// A full planter's water reads 0.6 before it's measured against what the crop wants. One
+    /// kept near its ideal level reads full.
+    pub fn water(self, crop: &Crop) -> f32 {
+        if self.full_water { (0.6 / crop.optimal_water).min(1.0) } else { 1.0 }
     }
 }
 
@@ -220,7 +233,7 @@ mod tests {
 
     #[test]
     fn crossbreed_stage_ignores_genes_and_conditions() {
-        let poor = Conditions { fertilized: false, other_quality: 0.5 };
+        let poor = Conditions { fertilized: false, full_water: false, other_quality: 0.5 };
         assert_eq!(Timeline::new(hemp(), 6, Conditions::PERFECT).unwrap().crossbreed, 2);
         assert_eq!(Timeline::new(hemp(), 0, poor).unwrap().crossbreed, 2);
         assert_eq!(Timeline::new(crop_by_key("blue_berry").unwrap(), 0, poor).unwrap().crossbreed, 6);
@@ -228,7 +241,7 @@ mod tests {
 
     #[test]
     fn fertiliser_matters_differently_per_crop() {
-        let plain = Conditions { fertilized: false, other_quality: 1.0 };
+        let plain = Conditions { fertilized: false, full_water: false, other_quality: 1.0 };
         assert!((plain.quality(hemp()) - 2.0 / 3.0).abs() < 1e-5);
         assert!((plain.quality(crop_by_key("blue_berry").unwrap()) - 0.75).abs() < 1e-5);
         assert!((plain.quality(crop_by_key("potato").unwrap()) - 6.0 / 7.0).abs() < 1e-5);
@@ -250,18 +263,31 @@ mod tests {
         assert_eq!(at(t.to_crossbreed()).0, Stage::Crossbreed);
         assert_eq!(at(t.to_mature()).0, Stage::Mature);
         // Unfertilised hemp grows at two thirds, so each tick adds about 6.7% of Sapling.
-        let plain = Conditions { fertilized: false, other_quality: 1.0 };
+        let plain = Conditions { fertilized: false, full_water: false, other_quality: 1.0 };
         let slow = Timeline::new(hemp(), 0, plain).unwrap();
         let (stage, done) = stage_at(hemp(), 0, plain, slow.to_sapling() + 3);
         assert_eq!(stage, Stage::Sapling);
         assert!((done - 0.2).abs() < 1e-4);
     }
 
+    /// Hemp in a full planter without fertiliser shows 67% health in game: its ground is
+    /// 0.6 / 0.9 and its water 0.6 / 0.85, and the lower one counts.
+    #[test]
+    fn a_full_planter_waters_by_crop() {
+        let full = Conditions { fertilized: false, full_water: true, other_quality: 1.0 };
+        assert!((full.water(hemp()) - 0.6 / 0.85).abs() < 1e-5);
+        assert!((full.quality(hemp()) - 2.0 / 3.0).abs() < 1e-5);
+        let fed = Conditions { fertilized: true, ..full };
+        assert!((fed.quality(hemp()) - 0.6 / 0.85).abs() < 1e-5);
+        assert!((fed.quality(crop_by_key("blue_berry").unwrap()) - 0.75).abs() < 1e-5);
+        assert_eq!(Conditions { full_water: false, ..fed }.quality(hemp()), 1.0);
+    }
+
     #[test]
     fn the_worst_quality_sets_the_pace() {
-        let dim = Conditions { fertilized: true, other_quality: 0.5 };
+        let dim = Conditions { fertilized: true, full_water: false, other_quality: 0.5 };
         assert_eq!(dim.quality(hemp()), 0.5);
         assert!(Timeline::new(hemp(), 0, dim).unwrap().to_crossbreed() > 24);
-        assert!(Timeline::new(hemp(), 0, Conditions { fertilized: true, other_quality: 0.0 }).is_err());
+        assert!(Timeline::new(hemp(), 0, Conditions { fertilized: true, full_water: false, other_quality: 0.0 }).is_err());
     }
 }

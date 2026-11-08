@@ -19,6 +19,8 @@
   </nav>
 
   <main>
+    <nav class="croptabs" id="cropTabs" role="tablist" aria-label="Crops"></nav>
+    <select class="addcrop" id="addCrop" aria-label="Add a crop tab"></select>
     <section class="view" id="view-breed">
       <header class="top">
         <h1>Find the shortest route to your plant</h1>
@@ -52,8 +54,11 @@
               <label>Crop <select id="crop"></select></label>
               <label>Neighbours, up to <select id="neighbours"><option>3</option><option>4</option><option selected>5</option><option>6</option><option>7</option><option>8</option></select></label>
               <label>Search for <select id="seconds"><option value="30">30 seconds</option><option value="60" selected>1 minute</option><option value="180">3 minutes</option><option value="600">10 minutes</option></select></label>
-              <label class="check"><input type="checkbox" id="fertilized" checked> Fertilised planter</label>
-              <label class="wide">Light, water and heat quality <output id="qualityOut">100%</output><input type="range" id="quality" min="10" max="100" value="100"></label>
+              <label class="check wide"><input type="checkbox" id="fertilized" checked> Use fertiliser</label>
+              <div class="wide watering" role="group" aria-label="Water">
+                <button class="wseg" data-water="full" title="Keep the planter topped up. Easier, but most crops grow a little slower.">Max water</button>
+                <button class="wseg" data-water="ideal" title="Keep the planter near its ideal water level for full speed.">Optimise water</button>
+              </div>
               <p class="hint wide" id="health"></p>
             </div>
           </article>
@@ -87,7 +92,7 @@
     </section>
 
     <section class="view" id="view-guide" hidden>
-      <div class="empty" id="guideEmpty"><h3>No plan running</h3><p>Pick a plan on the Breed tab and press Start guide.</p></div>
+      <div class="empty" id="guideEmpty"><h3 id="guideEmptyTitle">No plan running</h3><p id="guideEmptyText">Pick a plan on the Breed page and press Start guide.</p></div>
       <div id="guide" hidden>
         <div class="stagewrap">
           <div class="track" id="track"></div>
